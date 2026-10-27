@@ -8,13 +8,15 @@ import androidx.lifecycle.viewModelScope
 import com.makaohub.android.data.*
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
+import retrofit2.HttpException
 import java.util.Locale
 
 enum class Page { SPLASH, ENTRY, WELCOME, HOMES, PEACE, ROLE, REGISTER, LOGIN, OTP, FORGOT, RESET, ACCOUNT }
 
 /** Keeps requests alive through rotation, without persisting credentials in saved state. */
-class AuthViewModel : ViewModel() {
-    internal val repository = AuthRepository(createMakaoApi(BuildConfig.API_BASE_URL))
+class AuthViewModel(
+    internal val repository: AuthRepository = AuthRepository(createMakaoApi(BuildConfig.API_BASE_URL))
+) : ViewModel() {
     var page by mutableStateOf(Page.SPLASH); private set
     var role by mutableStateOf(SignupRole.RENTER); private set
     var busy by mutableStateOf(false); private set
@@ -35,7 +37,12 @@ class AuthViewModel : ViewModel() {
         if (page == Page.OTP && target != Page.OTP) challenge = null
         page = target
     }
-    fun selectRole(value: SignupRole) { if (!busy) role = value }
+    fun selectRole(value: SignupRole) {
+        if (!busy) {
+            if (value != role) challenge = null
+            role = value
+        }
+    }
     fun showMessage(value: String) { message = value }
 
     fun register(name: String, email: String, phone: String, password: String, confirm: String, consent: Boolean) {
@@ -50,18 +57,25 @@ class AuthViewModel : ViewModel() {
     fun login(email: String, password: String) {
         if (!validEmail(email) || password.isBlank()) { message = "Enter your email and password."; return }
         perform {
-            challenge = repository.login(LoginRequest(normalizeEmail(email), password))
+            challenge = repository.login(LoginRequest(normalizeEmail(email), password, role))
             otpFlow = OtpFlow.LOGIN
             page = Page.OTP
         }
     }
-    fun googleLogin(idToken: String) = perform {
-        challenge = repository.google(idToken)
+    fun googleLogin(idToken: String) = perform(onError = { error ->
+        if (error is HttpException && error.code() == 409
+            && error.problemCode() == "GOOGLE_REGISTRATION_REQUIRED") {
+            page = Page.ROLE
+            message = "Choose your role, then create your account."
+            true
+        } else false
+    }) {
+        challenge = repository.google(idToken, role)
         otpFlow = OtpFlow.GOOGLE_LOGIN
         page = Page.OTP
     }
-    fun googleRegister(idToken: String, name: String, phone: String, consent: Boolean) = perform {
-        challenge = repository.registerGoogle(GoogleRegisterRequest(idToken, name.trim(), normalizePhone(phone), role, consent))
+    fun googleRegister(idToken: String, name: String, consent: Boolean) = perform {
+        challenge = repository.registerGoogle(GoogleRegisterRequest(idToken, name.trim(), role, consent))
         otpFlow = OtpFlow.REGISTRATION
         page = Page.OTP
     }
@@ -69,7 +83,7 @@ class AuthViewModel : ViewModel() {
         val pending = challenge ?: return
         if (!code.matches(Regex("[0-9]{6}"))) { message = "Enter the six-digit verification code."; return }
         perform {
-            repository.verify(pending.challengeId, code, otpFlow)
+            repository.verify(pending.challengeId, code, otpFlow, role)
             challenge = null
             page = Page.ACCOUNT
             profile = repository.profile()
@@ -103,7 +117,7 @@ class AuthViewModel : ViewModel() {
     }
 
     /** Disable repeated taps and only advance after the backend accepts the request. */
-    private fun perform(action: suspend () -> Unit) {
+    private fun perform(onError: (Exception) -> Boolean = { false }, action: suspend () -> Unit) {
         if (busy) return
         busy = true
         message = null
@@ -112,7 +126,8 @@ class AuthViewModel : ViewModel() {
             catch (cancel: CancellationException) { throw cancel }
             catch (error: Exception) {
                 if (error is SessionExpired) { profile = null; page = Page.LOGIN }
-                message = friendlyError(error)
+                if (error is LoginRoleMismatch) { profile = null; challenge = null; page = Page.LOGIN }
+                if (!onError(error)) message = friendlyError(error)
             }
             finally { busy = false }
         }

@@ -40,7 +40,7 @@ private fun MakaoApp(model: AuthViewModel = viewModel()) {
             Page.PEACE -> Page.HOMES
             Page.ROLE -> Page.PEACE
             Page.REGISTER -> Page.ROLE
-            Page.LOGIN -> Page.ENTRY
+            Page.LOGIN -> Page.ROLE
             Page.OTP, Page.FORGOT -> Page.LOGIN
             Page.RESET -> Page.FORGOT
             else -> Page.ENTRY

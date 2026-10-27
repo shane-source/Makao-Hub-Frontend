@@ -235,7 +235,7 @@ import java.util.Locale
 
 @Composable private fun SharedPreview(model: SublessorViewModel) {
     val listing = model.selected ?: return
-    SharedHeading("Ready to welcome a roommate", "Step 4 of 4 · Preview and publish")
+    SharedHeading("Ready to welcome a roommate", "Step 4 of 4 · Preview and submit")
     SharedCard {
         LocalPhoto(model.media.firstNotNullOfOrNull { model.photos[it.id] })
         if (model.verification?.status == "VERIFIED") SharedStatus("Verified Sublessor")
@@ -254,7 +254,10 @@ import java.util.Locale
         SharedText("Private pin · ${if (model.location == null) "Missing" else "Saved"}")
         SharedText("Rental agreement · ${if (model.verification?.status == "VERIFIED") "Verified" else "Verification required"}")
     }
-    SharedButton("Publish shared listing", !model.busy && model.verification?.status == "VERIFIED") { model.transition("publish") }
+    if (model.listingReview?.moderationSubmittedAt == null) {
+        SharedButton("Submit shared listing for review", !model.busy && model.verification?.status == "VERIFIED"
+            && model.media.any { it.mediaType == "IMAGE" && it.confirmed } && model.location != null, model::submitListingReview)
+    } else SharedNote("Under staff review\nPublication remains locked until a moderator records a decision.")
     TextButton({ model.go(SharedScreen.DETAILS) }, enabled = !model.busy, modifier = Modifier.fillMaxWidth()) { Text("Edit shared listing") }
 }
 
@@ -275,11 +278,29 @@ import java.util.Locale
     SharedHeading("Shared-listing alternatives", "Manage, publish and media states")
     SharedCard {
         SharedText(listing.title); SharedStatus(listing.status)
-        when (listing.status) {
-            "DRAFT" -> { SharedLink("Edit shared listing", !model.busy) { model.go(SharedScreen.DETAILS) }; SharedLink("Manage media", !model.busy, model::loadMedia)
-                SharedButton("Publish shared listing", !model.busy && model.verification?.status == "VERIFIED") { model.transition("publish") } }
-            "PUBLISHED" -> SharedButton("Pause shared listing", !model.busy) { model.transition("pause") }
-            "PAUSED" -> SharedButton("Resume shared listing", !model.busy && model.verification?.status == "VERIFIED") { model.transition("resume") }
+        if (listing.status == "PUBLISHED") SharedButton("Pause shared listing", !model.busy) { model.transition("pause") }
+        else when (val review=model.listingReview) {
+            null -> SharedButton("Refresh review status", !model.busy) { model.go(SharedScreen.STATES) }
+            else -> when (review.moderationStatus) {
+                "PENDING" -> if (review.moderationSubmittedAt == null) {
+                    SharedLink("Edit shared listing", !model.busy) { model.go(SharedScreen.DETAILS) }
+                    SharedLink("Manage media", !model.busy, model::loadMedia)
+                    SharedButton("Submit shared listing for review", !model.busy && model.verification?.status == "VERIFIED"
+                        && model.media.any { it.mediaType == "IMAGE" && it.confirmed } && model.location != null, model::submitListingReview)
+                } else {
+                    SharedNote("Under staff review\nPublication remains locked until a moderator records a decision.")
+                    SharedLink("Refresh review status", !model.busy) { model.go(SharedScreen.STATES) }
+                }
+                "REJECTED" -> {
+                    SharedNote("Changes required\n${review.moderationReason ?: "Open the listing and correct the submitted details."}")
+                    SharedButton("Revise shared listing", !model.busy, model::reviseListingReview)
+                }
+                "APPROVED" -> {
+                    SharedNote("Approved\nThe current saved version may be published.")
+                    if (listing.status == "DRAFT") SharedButton("Publish shared listing", !model.busy) { model.transition("publish") }
+                    if (listing.status == "PAUSED") SharedButton("Resume shared listing", !model.busy) { model.transition("resume") }
+                }
+            }
         }
     }
 }
@@ -331,24 +352,45 @@ import java.util.Locale
 }
 
 @Composable private fun SharedInbox(model: SublessorViewModel) {
-    SharedHeading("Roommate conversations", "Your shared-home messages")
-    model.threads?.content?.forEach { value -> SharedCard { SharedText("Roommate conversation"); SharedStatus(value.status)
-        SharedLink("Open conversation", !model.busy) { model.openThread(value) } } }
-    if (model.threads?.content?.isEmpty() == true) SharedText("No conversations yet.", true)
+    var query by rememberSaveable { mutableStateOf("") }
+    ProtectedInboxHeader("Your roommate messages", query) { query = it }
+    val visible = model.threads?.content.orEmpty().filter { value ->
+        query.isBlank() || listOf(value.id, value.roommateInterestId, value.status)
+            .any { it.contains(query.trim(), ignoreCase = true) }
+    }
+    visible.forEach { value ->
+        ProtectedConversationRow(
+            title = "Verified Renter",
+            detail = "Roommate conversation · Interest ${value.roommateInterestId.take(8).uppercase()}",
+            status = value.status.lowercase().replace('_', ' ').replaceFirstChar { it.uppercase() },
+            enabled = !model.busy
+        ) { model.openThread(value) }
+    }
+    if (visible.isEmpty()) SharedText(if (query.isBlank()) "No conversations yet." else "No conversations match your search.", true)
     if (model.threads?.last == false) SharedLink("Load more", !model.busy, model::nextThreads)
+    Gap(12)
+    SharedNote("Keep communication inside Makao Hub\nPhone numbers, email addresses and social handles are masked and flagged for both people.")
 }
 @Composable private fun SharedConversation(model: SublessorViewModel, profile: MyProfile) {
-    SharedHeading("Roommate conversation", if (model.chatReady) "Connected" else "Disconnected")
-    if (model.messages?.hasMore == true) SharedLink("Load older messages", !model.busy, model::olderMessages)
-    model.messages?.items?.sortedWith(compareBy<OwnerMessage> { it.createdAt }.thenBy { it.id })?.forEach { message -> SharedCard {
-        SharedText(if (message.senderId == profile.id) "You" else "Renter", true); SharedText(message.content)
-        if (message.contactMasked) SharedStatus("Flagged · Contact details masked")
-    } }
-    if (model.thread?.status == "OPEN") {
-        SharedInput("Message", model.chatDraft, model.chatReady && !model.awaitingEcho, lines = 3, onChange = model::updateChat)
-        SharedButton(if (model.awaitingEcho) "Sending…" else "Send message", model.chatReady && !model.awaitingEcho && model.chatDraft.isNotBlank(), model::sendMessage)
-        if (!model.chatReady) SharedLink("Reconnect", !model.busy, model::reconnect)
-    }
+    val selectedThread = model.thread ?: return
+    ProtectedConversation(
+        title = "Verified Renter",
+        roleLabel = "Renter",
+        conversationType = "Roommate conversation",
+        contextLabel = "Interest ${selectedThread.roommateInterestId.take(8).uppercase()} · Conversation ${selectedThread.id.take(8).uppercase()}",
+        messages = model.messages?.items.orEmpty(),
+        ownUserId = profile.id,
+        connected = model.chatReady,
+        awaitingEcho = model.awaitingEcho,
+        threadOpen = selectedThread.status == "OPEN",
+        draft = model.chatDraft,
+        busy = model.busy,
+        hasOlder = model.messages?.hasMore == true,
+        onOlder = model::olderMessages,
+        onReconnect = model::reconnect,
+        onDraft = model::updateChat,
+        onSend = model::sendMessage
+    )
 }
 @Composable private fun SharedPayments(model: SublessorViewModel) {
     SharedHeading("Shared-space test payments", "Your payment records")
@@ -436,7 +478,7 @@ private fun sharedKes(value: Long) = "KSh " + NumberFormat.getIntegerInstance(Lo
 }
 
 @Composable private fun SharedDiscovery(model: SublessorViewModel) {
-    SharedHeading("People you may feel at home with", "Opted-in renters · Shared preferences")
+    SharedHeading("People you may feel at home with", "Opted-in renters · Shared preferences, not AI")
     model.discovery?.items?.forEach { person -> SharedCard {
         SharedText(person.displayName); SharedStatus("Verified Renter")
         person.preferences.areaLabel?.let { SharedText(it, true) }
@@ -461,13 +503,14 @@ private fun sharedKes(value: Long) = "KSh " + NumberFormat.getIntegerInstance(Lo
         SharedText("Budget · ${sharedKes(person.preferences.budgetMinKes)}–${sharedKes(person.preferences.budgetMaxKes)}")
     }
     SharedCard {
-        SharedText("Shared preferences", true)
+        SharedText("Deterministic preference comparison", true)
         val mine = model.preferences?.let { RoommateForm.from(it).answers } ?: emptyMap()
         val theirs = RoommateForm.from(person.preferences).answers
         val same = PreferenceQuestion.entries.filter { mine[it] == theirs[it] }
         SharedText(same.joinToString(" · ") { it.title }.ifBlank { "No shared answers" })
         SharedText("Different", true)
         SharedText(PreferenceQuestion.entries.filter { mine[it] != theirs[it] }.joinToString(" · ") { it.title }.ifBlank { "No different answers" })
+        SharedText("A percentage is not shown until the matching weights and rounding rule are agreed.", true)
     }
     SharedNote("A public profile, not an ID file\nPrivate identity evidence is never shared.")
     // The current backend opens chats after a renter expresses interest and the host accepts.
@@ -477,9 +520,11 @@ private fun sharedKes(value: Long) = "KSh " + NumberFormat.getIntegerInstance(Lo
 /** ID front/back, a camera selfie and a private agreement PDF; READY never means identity approval. */
 @Composable private fun SublessorVerification(model: SublessorViewModel) {
     val resolver = LocalContext.current.contentResolver
-    var step by rememberSaveable { mutableIntStateOf(2) }
+    var step by rememberSaveable { mutableIntStateOf(1) }
+    var idBack by rememberSaveable { mutableStateOf(false) }
     var correcting by rememberSaveable { mutableStateOf(false) }
     var choosing by remember { mutableStateOf<SharedEvidence?>(null) }
+    var sourceFor by remember { mutableStateOf<SharedEvidence?>(null) }
     var camera by remember { mutableStateOf<SharedEvidence?>(null) }
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         val type = choosing; choosing = null
@@ -488,64 +533,86 @@ private fun sharedKes(value: Long) = "KSh " + NumberFormat.getIntegerInstance(Lo
     fun choose(type: SharedEvidence) { choosing = type; picker.launch(if (type == SharedEvidence.RENTAL_AGREEMENT) arrayOf("application/pdf") else arrayOf("image/jpeg", "image/png")) }
     val status = model.verification?.status
     val terminal = status in listOf("PENDING", "VERIFIED") || status == "REJECTED" && !correcting
-    val back = { if (!model.busy) { if (camera != null) camera = null else if (!terminal && step > 2) step-- else model.go(SharedScreen.HOME) } }
+    val back = { if (!model.busy) {
+        if (camera != null) camera = null
+        else if (!terminal && step == 2 && idBack) idBack = false
+        else if (!terminal && step > 1) step-- else model.go(SharedScreen.HOME)
+    } }
     BackHandler(onBack = back)
     LaunchedEffect(status) { if (status in listOf("PENDING", "VERIFIED")) correcting = false }
-    PageBody(back, !model.busy) {
-        model.notice?.let { SharedNote(it) }
-        if (model.busy) { LinearProgressIndicator(Modifier.fillMaxWidth()); Gap(12) }
-        when {
-            terminal -> {
-                Heading(when (status) { "VERIFIED" -> "Verification Approved!"; "REJECTED" -> "Verification Rejected"; else -> "Documents Under Review" }); Gap(20)
-                SharedCard { SharedText(when (status) {
-                    "VERIFIED" -> "Your Sublessor role is verified."
-                    "REJECTED" -> model.verification?.rejectionReason ?: "Please contact support for the required corrections."
-                    else -> "Your ID, live photo and rental agreement are under review."
-                }) }
-                when (status) {
-                    "VERIFIED" -> SharedButton("Continue to your shared home", !model.busy) { model.go(SharedScreen.HOME) }
-                    "REJECTED" -> SharedButton("Re-submit documents", !model.busy) { correcting = true; step = 2 }
-                    else -> SharedButton("Close & Back to Main", !model.busy) { model.go(SharedScreen.HOME) }
-                }
-                SharedLink("Refresh status", !model.busy, model::refreshVerification)
-            }
-            else -> {
-                SharedText(if (step <= 4) "Step $step of 4" else "Review submission", true); Gap(10)
-                Heading(when (step) { 2 -> "Upload National ID"; 3 -> "Capture Live Photo"; 4 -> "Rental Agreement"; else -> "Review Submission" }); Gap(20)
-                if (camera != null) {
-                    val type = camera!!
-                    EvidenceCamera(type == SharedEvidence.SELFIE, !model.busy, { bitmap -> camera = null; model.captureEvidence(type, bitmap) }, model::showNotice)
-                } else when (step) {
-                    2 -> listOf(SharedEvidence.ID_FRONT, SharedEvidence.ID_BACK).forEach { type ->
-                        SharedCard {
-                            SharedText(type.title); SharedText(if (sharedEvidenceReady(type, model.documents)) "Uploaded" else "Required", true)
-                            SharedLink("Take ID Photo", !model.busy) { camera = type }
-                            SharedLink("Choose from gallery", !model.busy) { choose(type) }
-                        }
-                    }
-                    3 -> SharedCard {
-                        SharedText("Use good lighting and keep your face visible.")
-                        SharedText(if (sharedEvidenceReady(SharedEvidence.SELFIE, model.documents)) "Live photo uploaded" else "Live photo required", true)
-                        SharedLink("Capture Live Photo", !model.busy) { camera = SharedEvidence.SELFIE }
-                    }
-                    4 -> SharedCard {
-                        SharedText("Upload your rental agreement.")
-                        SharedText("PDF only · Up to 10 MB", true)
-                        SharedLink("Choose agreement PDF", !model.busy) { choose(SharedEvidence.RENTAL_AGREEMENT) }
-                    }
-                    else -> SharedEvidence.entries.forEach { type -> SharedCard { SharedText(type.title); SharedText(if (sharedEvidenceReady(type, model.documents)) "Uploaded" else "Required", true) } }
-                }
-                model.documents.filter { it.status == "UPLOADING" && model.pendingEvidence == null }.forEach { value ->
-                    SharedLink("Confirm ${value.documentType.lowercase().replace('_', ' ')}", !model.busy) { model.confirmStoredEvidence(value.documentId) }
-                }
-                if (model.pendingEvidence != null) SharedButton("Retry current document", !model.busy, model::retryEvidence)
-                else if (camera == null) SharedButton(if (step == 5) "Submit Verification" else "Continue", !model.busy && when (step) {
-                    2 -> sharedEvidenceReady(SharedEvidence.ID_FRONT, model.documents) && sharedEvidenceReady(SharedEvidence.ID_BACK, model.documents)
-                    3 -> sharedEvidenceReady(SharedEvidence.SELFIE, model.documents)
-                    4 -> sharedEvidenceReady(SharedEvidence.RENTAL_AGREEMENT, model.documents)
-                    else -> sharedVerificationReady(model.documents)
-                }) { if (step == 5) model.submitVerification() else step++ }
-            }
+    sourceFor?.let { type -> IdSourceDialog(type.title, { sourceFor = null },
+        { sourceFor = null; camera = type }, { sourceFor = null; choose(type) }) }
+    if (!terminal && step == 1) {
+        PageBody(back, !model.busy) {
+            model.notice?.let { SharedNote(it); Gap(8) }
+            VerificationIntro(
+                role = "Sublessor",
+                subtitle = "Confirms your identity and rental agreement for the shared space.",
+                roleDocument = "Rental agreement",
+                onStart = { step = 2 }
+            )
         }
+        return
+    }
+    if (!terminal && step == 2) {
+        val type = if (idBack) SharedEvidence.ID_BACK else SharedEvidence.ID_FRONT
+        PageBody(back, !model.busy) {
+            model.notice?.let { SharedNote(it); Gap(8) }
+            if (camera != null) {
+                Heading(if (idBack) "Back of your ID" else "Front of your ID"); Gap(20)
+                key(type) { EvidenceCamera(false, !model.busy, { bitmap -> camera = null; model.captureEvidence(type, bitmap) }, model::showNotice) }
+                SharedLink("Cancel camera", !model.busy) { camera = null }
+            } else IdDocumentStep(idBack, model.documents.firstOrNull { it.documentType == type.name },
+                pending = model.pendingEvidenceType == type.name, busy = model.busy,
+                editable = status in listOf("NOT_STARTED", "REJECTED"), progress = model.evidenceProgress, stage = model.stage, name = model.evidenceNames[type],
+                frontReady = sharedEvidenceReady(SharedEvidence.ID_FRONT, model.documents),
+                choose = { sourceFor = type }, retry = {
+                    if (model.pendingEvidenceType == type.name) model.retryEvidence()
+                    else model.documents.firstOrNull { it.documentType == type.name }?.let { model.confirmStoredEvidence(it.documentId) }
+                }, next = { if (!idBack) idBack = true else step = 3 })
+        }
+        return
+    }
+    PageBody(back, !model.busy) {
+        model.notice?.let { SharedNote(it); Gap(8) }
+        when {
+            terminal -> VerificationOutcomeScreen(
+                role = "Sublessor", status = status!!, rejectionReason = model.verification?.rejectionReason,
+                busy = model.busy, approvedAction = "Continue to listings",
+                onApproved = { model.go(SharedScreen.LISTINGS) },
+                onCorrect = { correcting = true; step = 2; idBack = false },
+                onClose = { model.go(SharedScreen.HOME) }, onRefresh = model::refreshVerification)
+            camera != null -> {
+                val type = camera!!
+                Heading(if (type == SharedEvidence.SELFIE) "A quick selfie" else type.title)
+                Gap(20)
+                key(type) { EvidenceCamera(type == SharedEvidence.SELFIE, !model.busy,
+                    { bitmap -> camera = null; model.captureEvidence(type, bitmap) }, model::showNotice) }
+                SharedLink("Cancel camera", !model.busy) { camera = null }
+            }
+            step == 3 -> {
+                val ready = sharedEvidenceReady(SharedEvidence.SELFIE, model.documents)
+                VerificationSelfieStep(ready, model.busy) {
+                    if (ready) step = 4 else camera = SharedEvidence.SELFIE
+                }
+            }
+            step == 4 -> VerificationRoleDocumentStep(
+                title = "Your rental agreement",
+                subtitle = "Sublessor · Confirm your shared-space tenancy",
+                label = "Rental agreement",
+                name = model.evidenceNames[SharedEvidence.RENTAL_AGREEMENT],
+                ready = sharedEvidenceReady(SharedEvidence.RENTAL_AGREEMENT, model.documents),
+                busy = model.busy,
+                guidance = "Signed agreement\nInclude the tenant name, property and relevant signed pages.\n\nShared space\nFor a spare room or servant quarter, not a whole-property landlord listing.",
+                privacy = "Only verification staff can view this\nRoommate discovery does not expose your agreement or exact address.",
+                choose = { choose(SharedEvidence.RENTAL_AGREEMENT) }, next = { step = 5 })
+            else -> VerificationReviewSummary(
+                roleDocument = "Rental agreement", ready = sharedVerificationReady(model.documents), busy = model.busy,
+                submit = model::submitVerification, replace = { step = 2; idBack = false })
+        }
+        model.documents.filter { it.status == "UPLOADING" && model.pendingEvidence == null }.forEach { value ->
+            SharedLink("Confirm ${value.documentType.lowercase().replace('_', ' ')}", !model.busy) { model.confirmStoredEvidence(value.documentId) }
+        }
+        if (model.pendingEvidence != null) SharedButton("Retry current document", !model.busy, model::retryEvidence)
     }
 }

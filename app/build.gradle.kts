@@ -17,8 +17,10 @@ android {
     }
 
     buildFeatures { compose = true; buildConfig = true }
+    val mockPayments = providers.gradleProperty("MAKAO_MOCK_PAYMENTS_ENABLED").orElse("true").get()
+    require(mockPayments == "true" || mockPayments == "false")
     buildTypes {
-        getByName("debug") { buildConfigField("boolean", "MOCK_PAYMENTS_ENABLED", "true") }
+        getByName("debug") { buildConfigField("boolean", "MOCK_PAYMENTS_ENABLED", mockPayments) }
         getByName("release") { buildConfigField("boolean", "MOCK_PAYMENTS_ENABLED", "false") }
     }
 

@@ -78,6 +78,7 @@ class SublessorViewModel(private val repository: SublessorRepository, private va
     var documents by mutableStateOf<List<OwnerVerificationDocument>>(emptyList()); private set
     var listings by mutableStateOf<List<SharedListing>>(emptyList()); private set
     var selected by mutableStateOf<SharedListing?>(null); private set
+    var listingReview by mutableStateOf<OwnerListingReview?>(null); private set
     var form by mutableStateOf(SharedForm())
     var media by mutableStateOf<List<OwnerMedia>>(emptyList()); private set
     var location by mutableStateOf<OwnerLocation?>(null); private set
@@ -100,6 +101,9 @@ class SublessorViewModel(private val repository: SublessorRepository, private va
     val previews = mutableStateMapOf<SharedEvidence, ByteArray>()
     var stage by mutableStateOf<String?>(null); private set
     var pendingEvidence by mutableStateOf<String?>(null); private set
+    var evidenceProgress by mutableStateOf<Int?>(null); private set
+    val evidenceNames = mutableStateMapOf<SharedEvidence, String>()
+    val pendingEvidenceType: String? get() = evidenceTicket?.documentType
     var pendingMedia by mutableStateOf<String?>(null); private set
     private var evidenceTicket: VerificationUploadTicket? = null
     private var evidenceBytes: ByteArray? = null
@@ -137,6 +141,12 @@ class SublessorViewModel(private val repository: SublessorRepository, private va
             SharedScreen.INTERESTS -> interests = repository.interests()
             SharedScreen.INBOX -> threads = repository.threads(0)
             SharedScreen.PAYMENTS -> payments = repository.payments(0)
+            SharedScreen.STATES -> {
+                val id=requireNotNull(selected).id
+                listingReview = repository.review(id)
+                media = repository.media(id)
+                location = try { repository.location(id) } catch (e: HttpException) { if (e.code() == 404) null else throw e }
+            }
             SharedScreen.PREFERENCES, SharedScreen.PREFERENCE_SUMMARY -> {
                 preferences = try { repository.preferences() } catch (e: HttpException) { if (e.code() == 404) null else throw e }
                 preferenceForm = preferences?.let(RoommateForm::from) ?: RoommateForm()
@@ -154,15 +164,24 @@ class SublessorViewModel(private val repository: SublessorRepository, private va
     fun edit(value: SharedListing) {
         if (busy) return
         selected = value; form = SharedForm.from(value); resetMedia()
-        screen = if (value.status == "DRAFT") SharedScreen.DETAILS else SharedScreen.STATES
-        run { household = repository.household(value.id); form = form.withHousehold(requireNotNull(household)) }
+        run {
+            household = repository.household(value.id); form = form.withHousehold(requireNotNull(household))
+            listingReview = repository.review(value.id)
+            screen = if (value.status == "DRAFT" && listingReview?.moderationStatus == "PENDING"
+                && listingReview?.moderationSubmittedAt == null) SharedScreen.DETAILS else SharedScreen.STATES
+            if (screen == SharedScreen.STATES) {
+                media = repository.media(value.id)
+                location = try { repository.location(value.id) } catch (e: HttpException) { if (e.code() == 404) null else throw e }
+            }
+        }
     }
-    private fun resetMedia() { media = emptyList(); location = null; household = null; mediaTicket = null; mediaUri = null; mediaTransferred = false; pendingMedia = null }
+    private fun resetMedia() { media = emptyList(); location = null; household = null; listingReview = null; mediaTicket = null; mediaUri = null; mediaTransferred = false; pendingMedia = null }
     fun saveDraft(next: Boolean) {
         form.error()?.let { notice = it; return }
         run {
             selected = repository.save(selected?.id, form.request())
             household = repository.saveHousehold(selected!!.id, form.household())
+            listingReview = null
             listings = repository.listings()
             if (next) { media = repository.media(selected!!.id); screen = SharedScreen.MEDIA } else screen = SharedScreen.LISTINGS
         }
@@ -211,12 +230,14 @@ class SublessorViewModel(private val repository: SublessorRepository, private va
             repository.transfer(ticket, body); mediaTransferred = true
         }
         repository.confirmMedia(requireNotNull(selected).id, ticket.mediaId)
+        listingReview = null
         if (ticket.mediaType == "IMAGE") mediaUri?.let { photos[ticket.mediaId] = it }
         mediaTicket = null; mediaUri = null; mediaTransferred = false; pendingMedia = null
         media = repository.media(requireNotNull(selected).id)
     }
     fun deleteMedia(value: OwnerMedia) = run {
         repository.deleteMedia(requireNotNull(selected).id, value.id); photos.remove(value.id)
+        listingReview = null
         if (mediaTicket?.mediaId == value.id) { mediaTicket = null; mediaUri = null; mediaTransferred = false; pendingMedia = null }
         media = repository.media(requireNotNull(selected).id)
     }
@@ -228,11 +249,35 @@ class SublessorViewModel(private val repository: SublessorRepository, private va
         if (area.trim().isEmpty() || area.trim().length > 150 || !validOwnerPin(latitude, longitude)) { notice = "Enter a public area and select the home on the map."; return }
         run {
             location = repository.saveLocation(requireNotNull(selected).id, OwnerLocation(area.trim(), BigDecimal.valueOf(latitude), BigDecimal.valueOf(longitude)))
+            listingReview = null
             screen = SharedScreen.PREVIEW
         }
     }
-    fun transition(action: String) = run {
-        selected = repository.transition(requireNotNull(selected).id, action); listings = repository.listings(); screen = SharedScreen.STATES
+    fun submitListingReview() = run {
+        listingReview = repository.submitReview(requireNotNull(selected).id)
+        notice = "Shared listing submitted for staff review."
+    }
+    fun reviseListingReview() = run {
+        val id=requireNotNull(selected).id
+        listingReview = repository.reviseReview(id)
+        listings = repository.listings()
+        selected = listings.first { it.id == id }
+        form = SharedForm.from(requireNotNull(selected))
+        household = repository.household(id)
+        form = form.withHousehold(requireNotNull(household))
+        screen = SharedScreen.DETAILS
+        notice = "Update the shared listing, then submit it for review again."
+    }
+    fun transition(action: String) {
+        if (action == "publish" && listingReview?.moderationStatus != "APPROVED") {
+            notice = "Staff approval is required before publication."
+            return
+        }
+        run {
+        selected = repository.transition(requireNotNull(selected).id, action)
+        listingReview = repository.review(requireNotNull(selected).id)
+        listings = repository.listings(); screen = SharedScreen.STATES
+        }
     }
     fun openApplication(value: OwnerApplication) { if (!busy) { application = value; screen = SharedScreen.APPLICATION } }
     fun decide(action: String, reason: String? = null) = run { application = repository.decide(requireNotNull(application).id, action, reason); applications = repository.applications() }
@@ -300,28 +345,35 @@ class SublessorViewModel(private val repository: SublessorRepository, private va
     }
     fun uploadEvidence(type: SharedEvidence, resolver: ContentResolver, uri: Uri) = run {
         stage = "Preparing file"
-        val bytes = withContext(Dispatchers.IO) { if (type == SharedEvidence.RENTAL_AGREEMENT) VerificationDocuments.fromUri(resolver, uri) else VerificationImages.fromUri(resolver, uri) }
-        beginEvidence(type, bytes)
+        val (name, bytes) = withContext(Dispatchers.IO) { evidenceDisplayName(resolver, uri) to
+            if (type == SharedEvidence.RENTAL_AGREEMENT) VerificationDocuments.fromUri(resolver, uri) else VerificationImages.fromUri(resolver, uri) }
+        beginEvidence(type, bytes, name)
     }
     fun captureEvidence(type: SharedEvidence, bitmap: Bitmap) {
         if (busy) { bitmap.recycle(); return }
         run { try {
             require(type != SharedEvidence.RENTAL_AGREEMENT)
             val bytes = withContext(Dispatchers.IO) { VerificationImages.fromBitmap(bitmap) }
-            beginEvidence(type, bytes)
+            beginEvidence(type, bytes, when (type) {
+                SharedEvidence.ID_FRONT -> "national_id_front.jpg"
+                SharedEvidence.ID_BACK -> "national_id_back.jpg"
+                else -> "selfie_capture.jpg"
+            })
         } finally { bitmap.recycle() } }
     }
-    internal suspend fun beginEvidence(type: SharedEvidence, bytes: ByteArray) {
+    internal suspend fun beginEvidence(type: SharedEvidence, bytes: ByteArray, displayName: String? = null) {
         if (verification?.status !in listOf("NOT_STARTED", "REJECTED")) { bytes.fill(0); notice = "Refresh your verification status before uploading."; return }
         // A new camera/gallery choice explicitly replaces this type, even when local metadata is stale.
         // Keep the previous file retryable until the server accepts the replacement ticket.
         val ticket = try { repository.ticket(type, replace = true) } catch (e: Exception) { bytes.fill(0); throw e }
         if (ticket.documentType != type.name || ticket.contentType != type.mime) { bytes.fill(0); error("Unexpected evidence format") }
         evidenceBytes?.fill(0)
-        evidenceTicket?.let { previews.remove(SharedEvidence.valueOf(it.documentType))?.fill(0) }
+        previews.remove(type)?.fill(0)
+        evidenceNames.remove(type)
+        displayName?.let { evidenceNames[type] = it }
         documents = documents.filterNot { it.documentType == type.name }
-        evidenceTicket = ticket; evidenceBytes = bytes; evidenceTransferred = false; pendingEvidence = ticket.documentId
-        if (type != SharedEvidence.RENTAL_AGREEMENT) withContext(Dispatchers.IO) { VerificationImages.thumbnail(bytes) }?.let { previews.put(type, it)?.fill(0) }
+        evidenceTicket = ticket; evidenceBytes = bytes; evidenceTransferred = false; pendingEvidence = ticket.documentId; evidenceProgress = null
+        if (type == SharedEvidence.SELFIE) withContext(Dispatchers.IO) { VerificationImages.thumbnail(bytes) }?.let { previews.put(type, it)?.fill(0) }
         finishEvidence()
     }
     fun retryEvidence() = run {
@@ -335,11 +387,18 @@ class SublessorViewModel(private val repository: SublessorRepository, private va
     }
     private suspend fun finishEvidence() {
         val ticket = evidenceTicket ?: return
-        if (!evidenceTransferred) { stage = "Uploading"; repository.transferEvidence(ticket, requireNotNull(evidenceBytes).toRequestBody(ticket.contentType.toMediaType())); evidenceTransferred = true }
+        if (!evidenceTransferred) { stage = "Uploading"; repository.transferEvidence(ticket, EvidenceUploadBody(requireNotNull(evidenceBytes), ticket.contentType.toMediaType()) {
+            if (pendingEvidence == ticket.documentId) evidenceProgress = it
+        }); evidenceTransferred = true }
         stage = "Checking document"; confirmEvidence(ticket.documentId)
-        evidenceBytes?.fill(0); evidenceBytes = null; evidenceTicket = null; evidenceTransferred = false; pendingEvidence = null
+        evidenceBytes?.fill(0); evidenceBytes = null; evidenceTicket = null; evidenceTransferred = false; pendingEvidence = null; evidenceProgress = null
     }
-    fun confirmStoredEvidence(id: String) = run { confirmEvidence(id) }
+    fun confirmStoredEvidence(id: String) = run {
+        confirmEvidence(id)
+        if (pendingEvidence == id) {
+            evidenceBytes?.fill(0); evidenceBytes = null; evidenceTicket = null; evidenceTransferred = false; pendingEvidence = null; evidenceProgress = null
+        }
+    }
     private suspend fun confirmEvidence(id: String) {
         try { repository.confirmEvidence(id) } catch (e: HttpException) {
             if (e.code() != 409 || repository.documents().none { it.documentId == id && it.status == "READY" && it.securityChecked }) throw e
@@ -378,8 +437,8 @@ class SublessorViewModel(private val repository: SublessorRepository, private va
     }
     fun clear() {
         work?.cancel(); work = null; disconnect(); evidenceBytes?.fill(0); evidenceBytes = null; evidenceTicket = null
-        previews.values.forEach { it.fill(0) }; previews.clear(); pendingEvidence = null; evidenceTransferred = false
-        documents = emptyList(); verification = null; listings = emptyList(); selected = null; media = emptyList(); location = null
+        previews.values.forEach { it.fill(0) }; previews.clear(); evidenceNames.clear(); pendingEvidence = null; evidenceTransferred = false; evidenceProgress = null
+        documents = emptyList(); verification = null; listings = emptyList(); selected = null; listingReview = null; media = emptyList(); location = null
         applications = emptyList(); application = null; interests = emptyList(); threads = null; thread = null; messages = null; payments = null
         household = null; preferences = null; preferenceForm = RoommateForm(); discovery = null; renter = null; selectedRenterId = null
         mediaTicket = null; mediaUri = null; mediaTransferred = false; pendingMedia = null; photos.clear(); chatDraft = ""; messageId = null

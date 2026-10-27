@@ -17,7 +17,7 @@ class SublessorContractTest {
     private fun response(json: String, code: Int = 200) { server.enqueue(MockResponse().setResponseCode(code).setHeader("Content-Type", "application/json").setBody(json)) }
     private suspend fun login(role: String = "SUBLESSOR") {
         response("""{"accessToken":"synthetic","refreshToken":"synthetic-refresh","role":"$role","userId":"owner"}""")
-        auth.verify("synthetic-challenge", "123456", OtpFlow.LOGIN); server.takeRequest()
+        auth.verify("synthetic-challenge", "123456", OtpFlow.LOGIN, SignupRole.valueOf(role)); server.takeRequest()
     }
     @Before fun setup() { Dispatchers.setMain(UnconfinedTestDispatcher()); server = MockWebServer(); server.start(); auth = AuthRepository(createMakaoApi(server.url("/").toString())); repository = SublessorRepository(auth) }
     @After fun close() { server.shutdown(); Dispatchers.resetMain() }
@@ -88,6 +88,29 @@ class SublessorContractTest {
         response("""{"items":[],"page":2,"size":20,"totalElements":40,"hasNext":false}""")
         assertFalse(repository.discovery(2).hasNext)
         assertEquals("/api/v1/sublessor/roommate-discovery?page=2&size=20",server.takeRequest().path)
+    }
+    @Test fun sharedListingUsesTheSameServerModerationContract() = runBlocking {
+        login()
+        response("""{"id":"room","status":"DRAFT","moderation_status":"REJECTED","moderation_reason":"Photo needs correction","moderation_reviewed_at":"2026-10-21T08:00:00Z","updated_at":"2026-10-21T08:00:00Z"}""")
+        val rejected=repository.review("room")
+        assertEquals("REJECTED",rejected.moderationStatus)
+        assertEquals("Photo needs correction",rejected.moderationReason)
+        assertEquals("/api/v1/sublessor/listings/room/review",server.takeRequest().path)
+
+        response("{}")
+        response("""{"id":"room","status":"DRAFT","moderation_status":"PENDING","updated_at":"2026-10-21T08:01:00Z"}""")
+        val revised=repository.reviseReview("room")
+        assertEquals("/api/v1/sublessor/listings/room/revise-review",server.takeRequest().path)
+        assertEquals("/api/v1/sublessor/listings/room/review",server.takeRequest().path)
+        assertEquals("PENDING",revised.moderationStatus)
+        assertNull(revised.moderationSubmittedAt)
+
+        response("{}")
+        response("""{"id":"room","status":"DRAFT","moderation_status":"PENDING","moderation_submitted_at":"2026-10-21T08:02:00Z","updated_at":"2026-10-21T08:02:00Z"}""")
+        val submitted=repository.submitReview("room")
+        assertEquals("/api/v1/sublessor/listings/room/submit-review",server.takeRequest().path)
+        assertEquals("/api/v1/sublessor/listings/room/review",server.takeRequest().path)
+        assertNotNull(submitted.moderationSubmittedAt)
     }
     @Test fun preferencesRequireExplicitValidAnswersBudgetAndOptIn() {
         assertNotNull(RoommateForm().error())

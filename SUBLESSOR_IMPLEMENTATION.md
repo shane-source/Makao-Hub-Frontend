@@ -1,5 +1,15 @@
 # Sublessor workspace — implementation and reading guide
 
+## Screen-set reconciliation — 22 October 2026
+
+The twelve supplied Sublessor frames were checked against the current native workspace and its server contracts. The implemented journey covers the authenticated home, shared-listing details, media upload/confirmation/deletion, private address search and map pin, moderation preview, preference questionnaire/summary, opted-in renter discovery, public renter profile, application decisions, protected chat entry, test payment history, and listing publication states.
+
+Two visual examples are intentionally not copied as product behavior. The example compatibility percentages remain absent because matching weights and rounding are an open decision; the app shows deterministic shared/different answers and says why no percentage is available. Discovery cannot create an unsolicited chat because the chat-unlock model is also open; protected conversation continues through the existing accepted-interest path. These limits prevent the sample board from silently becoming a payment or matching rule.
+
+The backend supports the screen actions through role- and ownership-checked endpoints. V54/V55 store household/preferences and application rejection reasons without rewriting existing rows. V58 adds staff moderation state, submit/revise contracts, and a database publication guard. Exact coordinates remain in the private listing-location contract and never enter roommate discovery. Payment screens read the existing test ledger; they do not create a new payout destination or custody flow.
+
+Current automated evidence: the final Android source compiled, **73 unit/contract tests passed**, and the debug APK assembled. The focused Sublessor backend suite passed **22 tests** covering authorization, application ownership/rejection, verified-role evidence, document privacy, and confirmed-photo publication. A clean PostgreSQL migration run remains environment-dependent (`MAKAO_ROLE_TEST_DB_URL`) and was not rerun against any live database. Native screenshot comparison remains blocked because this environment has no configured emulator and the owner chose Android Studio/device verification rather than an automated installation.
+
 Date: 15 October 2026. This guide explains the changes for the supplied Sublessor board and the approved missing backend support. It is not a claim that the entire marketplace is production-ready.
 
 ## Pending dashboard shared with Landlord — 15 October 2026
@@ -52,7 +62,7 @@ Approved decision: store preferences but defer matching percentages. Discovery i
 
 The reference is `/tmp/codex-clipboard-977ff12e-f032-4078-a453-f9e814740eb9.png`. Cream/brown surfaces, rounded cards and the reference's information hierarchy are implemented with native Compose. Device screenshots are unavailable, so exact visual fidelity is **not verified**. See `design-qa.md`.
 
-Existing APIs do not provide listing moderation or direct Sublessor-started conversations from discovery. The UI therefore uses the real publish action and existing protected inbox. It does not fabricate an approval queue, profile-report endpoint, sample renters, scores, photos, booking balances or payout destination controls. Existing financial screens are history, not a new payment implementation.
+Listing moderation is now server-backed through the V58 submission, review-status, revision and publication contracts. Direct Sublessor-started conversations from discovery still have no decided contract, so the UI continues through the existing accepted-interest protected inbox. It does not fabricate a profile-report endpoint, sample renters, scores, photos, booking balances or payout destination controls. Existing financial screens are history, not a new payment implementation.
 
 ## End-to-end flow
 

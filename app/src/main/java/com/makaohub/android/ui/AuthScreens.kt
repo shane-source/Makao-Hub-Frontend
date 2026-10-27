@@ -21,6 +21,10 @@ import androidx.credentials.CredentialManager
 import androidx.credentials.CustomCredential
 import androidx.credentials.GetCredentialRequest
 import androidx.credentials.exceptions.GetCredentialCancellationException
+import androidx.credentials.exceptions.GetCredentialInterruptedException
+import androidx.credentials.exceptions.GetCredentialProviderConfigurationException
+import androidx.credentials.exceptions.GetCredentialUnsupportedException
+import androidx.credentials.exceptions.NoCredentialException
 import com.google.android.libraries.identity.googleid.GetSignInWithGoogleOption
 import com.google.android.libraries.identity.googleid.GoogleIdTokenCredential
 import com.makaohub.android.*
@@ -75,12 +79,10 @@ import java.time.Instant
         Gap(12)
         GoogleButton(model, validate = {
             when {
-                name.trim().length !in 2..150 -> "Enter your full name before continuing with Google."
-                !validPhone(phone) -> "Enter a Kenyan mobile number before continuing with Google."
                 !consent -> "Accept the Terms of Service and Privacy Policy to continue."
                 else -> null
             }
-        }) { model.googleRegister(it, name, phone, consent) }
+        }) { model.googleRegister(it, name, consent) }
         TextButton({ model.navigate(Page.LOGIN) }, enabled = !model.busy, modifier = Modifier.fillMaxWidth()) {
             Text("Already have an account? Sign in")
         }
@@ -92,7 +94,7 @@ import java.time.Instant
     var password by remember { mutableStateOf("") }
     PageBody(back, !model.busy) {
         Heading("Welcome back")
-        Gap(16); BodyCopy("Log in to manage your homes and matches.", muted = true); Gap()
+        Gap(16); BodyCopy("Sign in as ${model.role.title}.", muted = true); Gap()
         RequestState(model)
         Field("Email address", email, { email = it }, type = KeyboardType.Email, enabled = !model.busy)
         Field("Password", password, { password = it }, password = true, enabled = !model.busy)
@@ -202,12 +204,25 @@ import java.time.Instant
             try { onToken(getGoogleToken(context)) }
             catch (_: GetCredentialCancellationException) { model.showMessage("Google sign-in was cancelled.") }
             catch (cancel: CancellationException) { throw cancel }
-            catch (_: Exception) { model.showMessage("Google sign-in could not complete. Check your Google account and try again.") }
+            catch (error: Exception) { model.showMessage(googleCredentialErrorMessage(error)) }
             finally { requesting = false }
         }
     }, enabled = !model.busy && !requesting, modifier = Modifier.fillMaxWidth().heightIn(min = 50.dp)) {
         Text(if (requesting) "Connecting to Google…" else "Continue with Google")
     }
+}
+
+/** Converts provider failures into actionable text without exposing Google internals or account data. */
+internal fun googleCredentialErrorMessage(error: Exception): String = when (error) {
+    is GetCredentialProviderConfigurationException ->
+        "Google sign-in is not configured for this app build. Contact Makao Hub support."
+    is NoCredentialException ->
+        "No Google account is available on this device. Add an account and try again."
+    is GetCredentialUnsupportedException ->
+        "Google sign-in is not supported on this device. Update Google Play services and try again."
+    is GetCredentialInterruptedException ->
+        "Google sign-in was interrupted. Please try again."
+    else -> "Google rejected this app’s sign-in request. Contact Makao Hub support."
 }
 
 /** Android obtains the Google token; Spring Boot verifies it and creates the session. */

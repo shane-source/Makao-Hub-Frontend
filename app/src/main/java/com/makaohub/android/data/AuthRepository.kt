@@ -18,17 +18,25 @@ class AuthRepository(private val api: MakaoApi) {
 
     suspend fun register(body: RegisterRequest) = api.register(body)
     suspend fun login(body: LoginRequest) = api.login(body)
-    suspend fun google(idToken: String) = api.google(GoogleRequest(idToken))
+    suspend fun google(idToken: String, expectedRole: SignupRole) = api.google(GoogleRequest(idToken, expectedRole))
 
     /** Registration returns only an OTP challenge; it does not create a session. */
     suspend fun registerGoogle(body: GoogleRegisterRequest) = api.googleRegister(body)
 
-    suspend fun verify(challengeId: String, code: String, flow: OtpFlow) {
+    suspend fun verify(challengeId: String, code: String, flow: OtpFlow, expectedRole: SignupRole) {
         val request = VerifyOtpRequest(challengeId, code)
         val response = when (flow) {
             OtpFlow.REGISTRATION -> api.verifyRegistrationOtp(request)
             OtpFlow.GOOGLE_LOGIN -> api.verifyGoogleOtp(request)
             OtpFlow.LOGIN -> api.verifyOtp(request)
+        }
+        // Defense against an old/misconfigured server: never install a wrong-role session.
+        if (response.role != expectedRole.name) {
+            sessionLock.withLock { tokens = null }
+            try { api.logout(RefreshRequest(response.refreshToken)).requireSuccess() }
+            catch (cancel: CancellationException) { throw cancel }
+            catch (_: Exception) { /* Revocation is best effort; these tokens are never retained locally. */ }
+            throw LoginRoleMismatch()
         }
         sessionLock.withLock { tokens = response }
     }
@@ -81,6 +89,7 @@ class AuthRepository(private val api: MakaoApi) {
 
 class SessionExpired : Exception()
 class WorkspaceUnavailable : Exception()
+class LoginRoleMismatch : Exception()
 
 enum class OtpFlow { REGISTRATION, LOGIN, GOOGLE_LOGIN }
 
@@ -107,9 +116,11 @@ fun createMakaoApi(baseUrl: String): MakaoApi {
 
 /** Fixed messages avoid displaying raw server errors, tokens or document information. */
 fun friendlyError(error: Exception): String = when (error) {
+    is LoginRoleMismatch -> "This account does not match the selected role. Go back and choose your account’s role."
     is SessionExpired -> "Your session has expired. Please sign in again."
     is WorkspaceUnavailable -> "Switch to the required account role to open this workspace."
     is HttpException -> when (error.problemCode()) {
+        "ROLE_MISMATCH" -> friendlyError(LoginRoleMismatch())
         "OTP_PROVIDER_CONFIGURATION" -> "We couldn't send your code. Please contact support to restore email verification."
         "OTP_PROVIDER_RATE_LIMITED" -> "Email verification has reached a sending limit. Please wait before requesting another code."
         "OTP_PROVIDER_UNAVAILABLE" -> "Email verification is unavailable right now. If you requested a code, check your inbox before trying again."
@@ -127,7 +138,7 @@ fun friendlyError(error: Exception): String = when (error) {
 }
 
 /** Only allowlisted codes affect the UI. Raw server/provider details are never shown. */
-private fun HttpException.problemCode(): String? = runCatching {
+internal fun HttpException.problemCode(): String? = runCatching {
     response()?.errorBody()?.use { body ->
         body.charStream().use { reader ->
             val text = buildString {

@@ -47,6 +47,17 @@ class SublessorRepository(private val auth: AuthRepository) {
         if (id == null) api.createSharedListing(h, body) else api.updateSharedListing(h, id, body) }
     suspend fun transition(id: String, action: String) = auth.authorized("SUBLESSOR") { api, h ->
         require(action in listOf("publish", "pause", "resume", "archive")); api.sharedListingAction(h, id, action) }
+    suspend fun review(id: String) = auth.authorized("SUBLESSOR") { api, h -> api.sublessorListingReview(h, id) }
+    suspend fun submitReview(id: String) = auth.authorized("SUBLESSOR") { api, h ->
+        val response=api.submitSublessorListingReview(h,id)
+        if (!response.isSuccessful) throw HttpException(response)
+        api.sublessorListingReview(h,id)
+    }
+    suspend fun reviseReview(id: String) = auth.authorized("SUBLESSOR") { api, h ->
+        val response=api.reviseSublessorListingReview(h,id)
+        if (!response.isSuccessful) throw HttpException(response)
+        api.sublessorListingReview(h,id)
+    }
     suspend fun location(id: String) = auth.authorized("SUBLESSOR") { api, h -> api.sharedLocation(h, id) }
     suspend fun saveLocation(id: String, value: OwnerLocation) = auth.authorized("SUBLESSOR") { api, h -> api.saveSharedLocation(h, id, value) }
     suspend fun household(id: String) = auth.authorized("SUBLESSOR") { api, h -> api.sharedHousehold(h, id) }

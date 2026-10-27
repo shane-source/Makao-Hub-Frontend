@@ -58,20 +58,19 @@ private val VerifyGreenFill = Color(0xFFEBF4EF)
 private val VerifyAmber = Color(0xFFE78200)
 private val VerifyRed = Color(0xFFC91D20)
 
-/** Step 1 is deliberately absent. Readiness and outcomes come only from server state. */
+/** Role-specific entry with shared private-evidence steps; readiness and outcomes come only from server state. */
 @Composable
-fun LandlordVerificationScreen(model: LandlordViewModel, profile: MyProfile) {
+fun LandlordVerificationScreen(model: LandlordViewModel, @Suppress("UNUSED_PARAMETER") profile: MyProfile) {
     val context = LocalContext.current
-    var step by rememberSaveable { mutableIntStateOf(2) }
+    var step by rememberSaveable { mutableIntStateOf(1) }
+    var idBack by rememberSaveable { mutableStateOf(false) }
     var correcting by rememberSaveable { mutableStateOf(false) }
     var sourceFor by remember { mutableStateOf<OwnerEvidence?>(null) }
     var choosing by remember { mutableStateOf<OwnerEvidence?>(null) }
     var cameraId by remember { mutableStateOf<OwnerEvidence?>(null) }
-    var retakeSelfie by remember { mutableStateOf(false) }
-    var captureRequest by remember { mutableIntStateOf(0) }
     val status = model.verification?.status
     val terminal = status in listOf("PENDING", "VERIFIED") || (status == "REJECTED" && !correcting)
-    val editable = status in listOf("NOT_STARTED", "REJECTED") && !model.busy && model.verificationPendingId == null
+    val editable = status in listOf("NOT_STARTED", "REJECTED") && !model.busy
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         val type = choosing; choosing = null
         if (uri != null && type != null) model.uploadEvidence(type, context.contentResolver, uri)
@@ -83,7 +82,8 @@ fun LandlordVerificationScreen(model: LandlordViewModel, profile: MyProfile) {
     val back = {
         if (!model.busy) {
             if (cameraId != null) cameraId = null
-            else if (!terminal && step > 2) step--
+            else if (!terminal && step == 2 && idBack) idBack = false
+            else if (!terminal && step > 1) step--
             else model.go(OwnerScreen.HOME)
         }
     }
@@ -98,148 +98,88 @@ fun LandlordVerificationScreen(model: LandlordViewModel, profile: MyProfile) {
         lifecycle.lifecycle.addObserver(observer)
         onDispose { lifecycle.lifecycle.removeObserver(observer) }
     }
-    val snackbar = remember { SnackbarHostState() }
-    LaunchedEffect(model.notice) { model.notice?.let { snackbar.showSnackbar(it); model.dismissNotice() } }
-    val scroll = rememberScrollState()
-    LaunchedEffect(step, terminal) { scroll.scrollTo(0) }
-    val selfieReady = evidenceReady(OwnerEvidence.SELFIE, model.verificationDocuments)
-    Scaffold(containerColor = VerifyCream, snackbarHost = { SnackbarHost(snackbar) }, topBar = {
-        if (!terminal) Column(Modifier.statusBarsPadding().padding(horizontal = 24.dp)) {
-            Row(Modifier.fillMaxWidth().height(36.dp), verticalAlignment = Alignment.CenterVertically) {
-                TextButton(back, enabled = !model.busy, contentPadding = PaddingValues(0.dp)) {
-                    Icon(Icons.AutoMirrored.Outlined.ArrowBack, null, Modifier.size(20.dp), tint = VerifyBrown)
-                    Spacer(Modifier.width(5.dp))
-                    Text("Back", color = VerifyBrown, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
-                }
-                Spacer(Modifier.weight(1f))
-                if (step <= 4) Text("Step $step of 4", color = VerifyMuted, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
-            }
-            if (step <= 4) LinearProgressIndicator(progress = { step / 4f }, color = VerifyBrown,
-                trackColor = Color(0xFFE0E0E0), drawStopIndicator = {},
-                modifier = Modifier.fillMaxWidth().height(4.dp).clip(CircleShape))
+    sourceFor?.let { type -> IdSourceDialog(type.title, { sourceFor = null },
+        { sourceFor = null; cameraId = type }, { sourceFor = null; choose(type) }) }
+    if (!terminal && step == 1) {
+        PageBody(back, !model.busy) {
+            model.notice?.let { SharedNote(it); Gap(8) }
+            VerificationIntro(
+                role = "Landlord",
+                subtitle = "Confirms your identity and authority to list a whole property or unit.",
+                roleDocument = "Proof of ownership",
+                onStart = { step = 2 }
+            )
         }
-    }, bottomBar = {
-        Column(Modifier.navigationBarsPadding().padding(horizontal = 24.dp).padding(top = 12.dp, bottom = 28.dp)) {
-            when {
-                terminal && status == "VERIFIED" -> VerificationAction("Add Your First Listing", !model.busy, action = model::newListing)
-                terminal && status == "REJECTED" -> VerificationAction("Re-submit documents", !model.busy) { correcting = true; step = 2 }
-                terminal -> VerificationAction("Close & Back to Main", !model.busy, outlined = true) { model.go(OwnerScreen.HOME) }
-                cameraId != null -> VerificationAction("Capture ID Photo", editable) { captureRequest++ }
-                model.verificationPendingId != null -> VerificationAction("Retry", !model.busy, action = model::retryEvidence)
-                step == 2 -> VerificationAction("Continue", !model.busy && evidenceReady(OwnerEvidence.ID_FRONT, model.verificationDocuments)
-                    && evidenceReady(OwnerEvidence.ID_BACK, model.verificationDocuments)) { step = 3; captureRequest = 0 }
-                step == 3 -> VerificationAction(if (selfieReady && !retakeSelfie) "Continue" else "Capture Live Photo", !model.busy) {
-                    if (selfieReady && !retakeSelfie) step = 4 else captureRequest++
-                }
-                step == 4 -> VerificationAction("Proceed to Summary", !model.busy && evidenceReady(OwnerEvidence.OWNERSHIP_PROOF, model.verificationDocuments)) { step = 5 }
-                else -> VerificationAction("Submit Verification", !model.busy && verificationReady(model.verificationDocuments), action = model::submitVerification)
-            }
-        }
-    }) { insets ->
-        Column(Modifier.fillMaxSize().padding(insets).verticalScroll(scroll).padding(horizontal = 24.dp)
-            .padding(top = if (terminal) 40.dp else if (step == 5) 8.dp else 20.dp, bottom = 20.dp)) {
-            if (terminal) VerificationOutcome(model, status!!)
-            else when (step) {
-                2 -> {
-                    VerificationTitle("Upload National ID")
-                    Spacer(Modifier.height(5.dp))
-                    VerificationCopy("Government-issued documents help our team review your identity. Upload both sides clearly.")
-                    Spacer(Modifier.height(38.dp))
-                    if (cameraId != null) {
-                        val type = cameraId!!
-                        key(type) { EvidenceCamera(false, editable, { bitmap -> cameraId = null; model.uploadCameraEvidence(type, bitmap) },
-                            model::showNotice, captureRequest = captureRequest, showControls = false) }
-                    } else UploadArea(Icons.Outlined.CropFree, "Take ID Photo", "or choose from gallery", 166, editable) {
-                        sourceFor = if (!evidenceReady(OwnerEvidence.ID_FRONT, model.verificationDocuments)) OwnerEvidence.ID_FRONT else OwnerEvidence.ID_BACK
-                    }
-                    listOf(OwnerEvidence.ID_FRONT, OwnerEvidence.ID_BACK).forEach { type ->
-                        if (hasEvidence(model, type)) {
-                            Spacer(Modifier.height(20.dp))
-                            EvidenceFile(model, type) { if (editable) sourceFor = type }
-                        }
-                    }
-                    Spacer(Modifier.height(20.dp))
-                    Surface(color = VerifySand, shape = RoundedCornerShape(12.dp)) {
-                        Row(Modifier.fillMaxWidth().padding(16.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                            Icon(Icons.Outlined.GppMaybe, null, Modifier.size(20.dp), tint = VerifyBrown)
-                            Column {
-                                Text("Requirements", color = VerifyBrown, fontSize = 14.sp, fontWeight = FontWeight.Bold)
-                                Spacer(Modifier.height(3.dp))
-                                Text("Clear photos of National ID front and back. JPG, PNG up to 10MB. Make sure edges are visible and unblurred.", color = VerifyMuted, fontSize = 13.sp, lineHeight = 18.sp)
-                            }
-                        }
-                    }
-                }
-                3 -> {
-                    VerificationTitle("Verify Live Face")
-                    Spacer(Modifier.height(5.dp))
-                    VerificationCopy("Capture a clear live photo for our team to review with your ID.")
-                    Spacer(Modifier.height(26.dp))
-                    val preview = model.evidencePreviews[OwnerEvidence.SELFIE]
-                    if (!retakeSelfie && preview != null) Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
-                        PrivateEvidencePhoto(preview, Modifier.size(260.dp).clip(CircleShape).border(3.dp, VerifyBrown, CircleShape)
-                            .clickable(enabled = editable) { retakeSelfie = true; captureRequest = 0 })
-                    } else EvidenceCamera(true, editable, { bitmap -> retakeSelfie = false; model.uploadSelfie(bitmap) },
-                        model::showNotice, captureRequest = captureRequest, showControls = false)
-                    Spacer(Modifier.height(20.dp))
-                    Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
-                        Surface(color = VerifyGreenFill, shape = CircleShape) {
-                            Text(if (model.busy) model.evidenceStage ?: "Uploading photo" else if (selfieReady && !retakeSelfie) "Photo uploaded • Ready for review" else "Keep your face centred • Hold still",
-                                color = VerifyGreen, fontSize = 14.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(horizontal = 24.dp, vertical = 8.dp))
-                        }
-                    }
-                    Spacer(Modifier.height(30.dp))
-                    FaceTip("Ensure you are in a well-lit room")
-                    FaceTip("Remove glasses or hats before starting")
-                }
-                4 -> {
-                    VerificationTitle("Proof of Ownership")
-                    Spacer(Modifier.height(5.dp))
-                    VerificationCopy("Upload any document that matches your legal name to the property you wish to list.")
-                    Spacer(Modifier.height(36.dp))
-                    Text("Accepted Documents", fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = VerifyInk)
-                    Spacer(Modifier.height(8.dp))
-                    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                        ProofFact(Icons.Outlined.Description, "Title Deed", "Official Copy", Modifier.weight(1f))
-                        ProofFact(Icons.Outlined.ReceiptLong, "Utility Bill", "Water/Power", Modifier.weight(1f))
-                        ProofFact(Icons.Outlined.InsertDriveFile, "Mgmt Contract", "Valid Signed", Modifier.weight(1f))
-                    }
-                    Spacer(Modifier.height(20.dp))
-                    UploadArea(Icons.Outlined.CloudUpload, "Tap to upload document file", "PDF only, up to 10MB size", 126, editable) { choose(OwnerEvidence.OWNERSHIP_PROOF) }
-                    if (hasEvidence(model, OwnerEvidence.OWNERSHIP_PROOF)) {
-                        Spacer(Modifier.height(20.dp))
-                        EvidenceFile(model, OwnerEvidence.OWNERSHIP_PROOF) { if (editable) choose(OwnerEvidence.OWNERSHIP_PROOF) }
-                    }
-                }
-                else -> {
-                    VerificationTitle("Review Submission")
-                    Spacer(Modifier.height(5.dp))
-                    VerificationCopy("Ensure all details are accurate before sending to the Makao Hub verify desk.")
-                    Spacer(Modifier.height(38.dp))
-                    ReviewItem(if (profile.phoneNumber != null) "PHONE NUMBER" else "EMAIL ADDRESS", profile.phoneNumber ?: profile.email,
-                        if (profile.phoneNumber != null) Icons.Outlined.Phone else Icons.Outlined.Email, null, "View", !model.busy) { model.go(OwnerScreen.PROFILE) }
-                    Spacer(Modifier.height(16.dp))
-                    ReviewItem("NATIONAL ID PHOTOS", evidenceName(model, OwnerEvidence.ID_FRONT) + "\n" + evidenceName(model, OwnerEvidence.ID_BACK),
-                        Icons.Outlined.Badge, model.evidencePreviews[OwnerEvidence.ID_FRONT], "Edit", editable) { step = 2 }
-                    Spacer(Modifier.height(16.dp))
-                    ReviewItem("LIVE PHOTO", evidenceName(model, OwnerEvidence.SELFIE), Icons.Outlined.PersonOutline,
-                        model.evidencePreviews[OwnerEvidence.SELFIE], "Retake", editable, round = true) { retakeSelfie = true; captureRequest = 0; step = 3 }
-                    Spacer(Modifier.height(16.dp))
-                    ReviewItem("PROOF OF OWNERSHIP", evidenceName(model, OwnerEvidence.OWNERSHIP_PROOF), Icons.Outlined.Check,
-                        null, "Edit", editable, success = true) { step = 4 }
-                }
-            }
-        }
+        return
     }
-    sourceFor?.let { type -> AlertDialog(onDismissRequest = { sourceFor = null }, title = { Text(type.title) }, text = {
-        Column {
-            TextButton({ sourceFor = null; cameraId = type; captureRequest = 0 }) { Text("Take ID Photo") }
-            TextButton({ sourceFor = null; choose(type) }) { Text("Choose from gallery") }
-            TextButton({ sourceFor = if (type == OwnerEvidence.ID_FRONT) OwnerEvidence.ID_BACK else OwnerEvidence.ID_FRONT }) {
-                Text(if (type == OwnerEvidence.ID_FRONT) "ID back" else "ID front")
+    if (!terminal && step == 2) {
+        val type = if (idBack) OwnerEvidence.ID_BACK else OwnerEvidence.ID_FRONT
+        PageBody(back, !model.busy) {
+            model.notice?.let { SharedNote(it); Gap(8) }
+            if (cameraId != null) {
+                Heading(if (idBack) "Back of your ID" else "Front of your ID"); Gap(20)
+                key(type) { EvidenceCamera(false, editable, { bitmap -> cameraId = null; model.uploadCameraEvidence(type, bitmap) }, model::showNotice) }
+                SharedLink("Cancel camera", !model.busy) { cameraId = null }
+            } else IdDocumentStep(idBack, model.verificationDocuments.firstOrNull { it.documentType == type.name },
+                pending = model.pendingEvidenceType == type.name, busy = model.busy, editable = editable,
+                progress = model.evidenceProgress, stage = model.evidenceStage, name = model.evidenceNames[type],
+                frontReady = evidenceReady(OwnerEvidence.ID_FRONT, model.verificationDocuments),
+                choose = { sourceFor = type }, retry = {
+                    if (model.pendingEvidenceType == type.name) model.retryEvidence()
+                    else model.verificationDocuments.firstOrNull { it.documentType == type.name }?.let { model.confirmSavedEvidence(it.documentId) }
+                }, next = { if (!idBack) idBack = true else step = 3 })
+        }
+        return
+    }
+    PageBody(back, !model.busy) {
+        model.notice?.let { SharedNote(it); Gap(8) }
+        when {
+            terminal -> VerificationOutcomeScreen(
+                role = "Landlord", status = status!!, rejectionReason = model.verification?.rejectionReason,
+                busy = model.busy, approvedAction = "Continue to listings",
+                onApproved = { model.go(OwnerScreen.LISTINGS) },
+                onCorrect = { correcting = true; step = 2; idBack = false },
+                onClose = { model.go(OwnerScreen.HOME) }, onRefresh = model::loadVerification)
+            cameraId != null -> {
+                val type = cameraId!!
+                Heading(if (type == OwnerEvidence.SELFIE) "A quick selfie" else type.title)
+                Gap(20)
+                key(type) {
+                    EvidenceCamera(type == OwnerEvidence.SELFIE, editable, { bitmap ->
+                        cameraId = null
+                        if (type == OwnerEvidence.SELFIE) model.uploadSelfie(bitmap) else model.uploadCameraEvidence(type, bitmap)
+                    }, model::showNotice)
+                }
+                SharedLink("Cancel camera", !model.busy) { cameraId = null }
+            }
+            step == 3 -> {
+                val ready = evidenceReady(OwnerEvidence.SELFIE, model.verificationDocuments)
+                VerificationSelfieStep(ready, model.busy) {
+                    if (ready) step = 4 else cameraId = OwnerEvidence.SELFIE
+                }
+            }
+            step == 4 -> VerificationRoleDocumentStep(
+                title = "Proof of ownership",
+                subtitle = "Landlord · Confirm your authority to list",
+                label = "Ownership document",
+                name = model.evidenceNames[OwnerEvidence.OWNERSHIP_PROOF],
+                ready = evidenceReady(OwnerEvidence.OWNERSHIP_PROOF, model.verificationDocuments),
+                busy = model.busy,
+                guidance = "Include the relevant pages\n\nProperty address\nMatches your whole-property or unit listing.\n\nOwner or authorised representative\nThe name and authority must be readable.",
+                privacy = "Staff-only evidence\nThis document is never published in the listing or sent to applicants.",
+                choose = { choose(OwnerEvidence.OWNERSHIP_PROOF) }, next = { step = 5 })
+            else -> VerificationReviewSummary(
+                roleDocument = "Proof of ownership",
+                ready = verificationReady(model.verificationDocuments), busy = model.busy,
+                submit = model::submitVerification, replace = { step = 2; idBack = false })
+        }
+        model.verificationDocuments.filter { it.status == "UPLOADING" && model.verificationPendingId == null }.forEach { value ->
+            SharedLink("Confirm ${value.documentType.lowercase().replace('_', ' ')}", !model.busy) {
+                model.confirmSavedEvidence(value.documentId)
             }
         }
-    }, confirmButton = { TextButton({ sourceFor = null }) { Text("Cancel") } }) }
+        if (model.verificationPendingId != null) SharedButton("Retry current document", !model.busy, model::retryEvidence)
+    }
 }
 
 @Composable private fun VerificationOutcome(model: LandlordViewModel, status: String) {

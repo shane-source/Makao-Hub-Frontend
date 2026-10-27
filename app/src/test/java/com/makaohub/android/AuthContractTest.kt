@@ -47,21 +47,37 @@ class AuthContractTest {
         catch (_: SessionExpired) { }
         assertEquals(1, server.requestCount)
         respond(tokens("signup-access", "signup-refresh"))
-        repository.verify("test-challenge", "123456", OtpFlow.REGISTRATION)
+        repository.verify("test-challenge", "123456", OtpFlow.REGISTRATION, SignupRole.SUBLESSOR)
         assertEquals("/api/v1/auth/register/verify-otp", server.takeRequest().path)
         respond(profile)
         repository.profile()
         assertEquals("Bearer signup-access", server.takeRequest().getHeader("Authorization"))
     }
 
-    @Test fun loginSendsNoRoleAndDoesNotCreateSessionBeforeOtp() = runBlocking {
+    @Test fun googleSignupOmitsPhoneAndKeepsSelectedRoleAndOtpGate() = runBlocking {
+        respond(challenge, 201)
+        repository.registerGoogle(GoogleRegisterRequest("synthetic-google-token", "", SignupRole.LANDLORD, true))
+        val request = server.takeRequest()
+        assertEquals("/api/v1/auth/google/register", request.path)
+        val body = JsonParser.parseString(request.body.readUtf8()).asJsonObject
+        assertEquals("LANDLORD", body["role"].asString)
+        assertTrue(body["termsAndPrivacyAccepted"].asBoolean)
+        assertFalse(body.has("phoneNumber"))
+        assertFalse(body.has("password"))
+        try { repository.profile(); fail("Google signup still requires email OTP") }
+        catch (_: SessionExpired) { }
+        assertEquals(1, server.requestCount)
+    }
+
+    @Test fun loginSendsExpectedRoleAndDoesNotCreateSessionBeforeOtp() = runBlocking {
         respond(challenge)
-        val result = repository.login(LoginRequest("test@example.test", "example-password"))
+        val result = repository.login(LoginRequest("test@example.test", "example-password", SignupRole.SUBLESSOR))
         assertEquals("••••@example.test", result.maskedEmail)
         val request = server.takeRequest()
         assertEquals("/api/v1/auth/login", request.path)
         val json = JsonParser.parseString(request.body.readUtf8()).asJsonObject
-        assertEquals(setOf("email", "password"), json.keySet())
+        assertEquals(setOf("email", "password", "expectedRole"), json.keySet())
+        assertEquals("SUBLESSOR", json["expectedRole"].asString)
         try { repository.profile(); fail("Login alone must not authorize profile access") }
         catch (_: SessionExpired) { }
         assertEquals(1, server.requestCount)
@@ -69,7 +85,7 @@ class AuthContractTest {
 
     @Test fun failedOtpNeverGrantsSession() = runBlocking {
         respond("{}", 401)
-        try { repository.verify("test-challenge", "123456", OtpFlow.LOGIN); fail("Must reject invalid OTP") }
+        try { repository.verify("test-challenge", "123456", OtpFlow.LOGIN, SignupRole.SUBLESSOR); fail("Must reject invalid OTP") }
         catch (error: HttpException) { assertEquals(401, error.code()) }
         try { repository.profile(); fail("Profile must remain unauthenticated") }
         catch (_: SessionExpired) { }
@@ -78,7 +94,7 @@ class AuthContractTest {
 
     @Test fun verifiedSessionUsesBearerTokenAndServerRole() = runBlocking {
         respond(tokens("test-access", "test-refresh"))
-        repository.verify("test-challenge", "123456", OtpFlow.LOGIN)
+        repository.verify("test-challenge", "123456", OtpFlow.LOGIN, SignupRole.SUBLESSOR)
         val verify = server.takeRequest()
         assertEquals("/api/v1/auth/login/verify-otp", verify.path)
         val json = JsonParser.parseString(verify.body.readUtf8()).asJsonObject
@@ -90,7 +106,7 @@ class AuthContractTest {
 
     @Test fun concurrentProfileRequestsRotateRefreshTokenOnlyOnce() = runBlocking {
         respond(tokens("old-access", "old-refresh"))
-        repository.verify("test-challenge", "123456", OtpFlow.LOGIN)
+        repository.verify("test-challenge", "123456", OtpFlow.LOGIN, SignupRole.SUBLESSOR)
         server.takeRequest()
         respond("{}", 401)
         respond(tokens("new-access", "new-refresh"))
@@ -117,7 +133,7 @@ class AuthContractTest {
 
     @Test fun logoutClearsLocalSessionEvenWhenServerFails() = runBlocking {
         respond(tokens("access", "refresh"))
-        repository.verify("test-challenge", "123456", OtpFlow.LOGIN)
+        repository.verify("test-challenge", "123456", OtpFlow.LOGIN, SignupRole.SUBLESSOR)
         respond("{}", 500)
         try { repository.logout(); fail("Server failure must be reported") }
         catch (_: HttpException) { }
@@ -153,7 +169,7 @@ class AuthContractTest {
     @Test fun errorsUseSafeCodesAndNeverDisplayProviderDetails() = runBlocking {
         for (code in listOf("OTP_PROVIDER_CONFIGURATION", "OTP_PROVIDER_RATE_LIMITED", "OTP_PROVIDER_UNAVAILABLE", "UNKNOWN")) {
             respond("""{"code":"$code","detail":"private provider content"}""", 503)
-            try { repository.login(LoginRequest("test@example.test", "example-password")); fail("Must fail") }
+            try { repository.login(LoginRequest("test@example.test", "example-password", SignupRole.SUBLESSOR)); fail("Must fail") }
             catch (error: HttpException) {
                 val message = friendlyError(error)
                 assertFalse(message.contains("private provider content"))
@@ -166,9 +182,59 @@ class AuthContractTest {
             }
         }
         respond("<html>private provider content</html>", 503)
-        try { repository.login(LoginRequest("test@example.test", "example-password")); fail("Must fail") }
+        try { repository.login(LoginRequest("test@example.test", "example-password", SignupRole.SUBLESSOR)); fail("Must fail") }
         catch (error: HttpException) {
             assertEquals("The service is temporarily unavailable. Please try again.", friendlyError(error))
         }
+    }
+
+    @Test fun passwordAndGoogleLoginSendEachSelectedRoleAndRejectMismatches() = runBlocking {
+        for (role in SignupRole.entries) {
+            for (google in listOf(false, true)) {
+                respond("""{"code":"ROLE_MISMATCH","detail":"private server detail"}""", 403)
+                try {
+                    if (google) repository.google("synthetic-token", role)
+                    else repository.login(LoginRequest("test@example.test", "example-password", role))
+                    fail("Wrong-role login must fail")
+                } catch (error: HttpException) {
+                    assertEquals(403, error.code())
+                    assertTrue(friendlyError(error).contains("selected role"))
+                }
+                val request = server.takeRequest()
+                assertEquals(if (google) "/api/v1/auth/google" else "/api/v1/auth/login", request.path)
+                assertEquals(role.name, JsonParser.parseString(request.body.readUtf8()).asJsonObject["expectedRole"].asString)
+                try { repository.profile(); fail("Mismatch must not grant access") }
+                catch (_: SessionExpired) { }
+            }
+        }
+        assertEquals(6, server.requestCount)
+    }
+
+    @Test fun wrongRoleOtpResponseIsDiscardedAndRevokedForEveryFlow() = runBlocking {
+        for (flow in OtpFlow.entries) {
+            respond(tokens("wrong-role-access", "wrong-role-refresh")) // Stored role is SUBLESSOR.
+            server.enqueue(MockResponse().setResponseCode(204))
+            try {
+                repository.verify("test-challenge", "123456", flow, SignupRole.RENTER)
+                fail("Never store wrong-role tokens")
+            } catch (_: LoginRoleMismatch) { }
+            server.takeRequest()
+            val logout = server.takeRequest()
+            assertEquals("/api/v1/auth/logout", logout.path)
+            assertEquals("wrong-role-refresh", JsonParser.parseString(logout.body.readUtf8()).asJsonObject["refreshToken"].asString)
+            try { repository.profile(); fail("Mismatch must remain unauthenticated") }
+            catch (_: SessionExpired) { }
+        }
+        assertEquals(6, server.requestCount)
+    }
+
+    @Test fun wrongRoleTokensStayDiscardedWhenServerRevocationFails() = runBlocking {
+        respond(tokens("wrong-access", "wrong-refresh"))
+        respond("{}", 503)
+        try { repository.verify("test-challenge", "123456", OtpFlow.LOGIN, SignupRole.LANDLORD); fail("Wrong role") }
+        catch (_: LoginRoleMismatch) { }
+        try { repository.profile(); fail("Revocation failure must never install tokens") }
+        catch (_: SessionExpired) { }
+        assertEquals(2, server.requestCount)
     }
 }

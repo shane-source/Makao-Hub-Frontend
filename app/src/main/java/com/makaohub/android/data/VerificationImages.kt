@@ -6,10 +6,19 @@ import android.graphics.BitmapFactory
 import android.graphics.Matrix
 import android.media.ExifInterface
 import android.net.Uri
+import android.provider.OpenableColumns
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 
 class VerificationImageRejected : Exception("Choose a readable JPEG, PNG or WebP image of at most 10 MB and 25 megapixels.")
+
+/** Untrusted display metadata only: bounded, never used as an object path or persisted. */
+internal fun evidenceDisplayName(resolver: ContentResolver, uri: Uri): String? = runCatching {
+    resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+        val index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+        if (cursor.moveToFirst() && index >= 0) cursor.getString(index)?.filter { !it.isISOControl() }?.take(120) else null
+    }
+}.getOrNull()
 
 internal fun validVerificationImageDimensions(width: Int, height: Int) =
     width > 0 && height > 0 && width.toLong() * height <= 25_000_000

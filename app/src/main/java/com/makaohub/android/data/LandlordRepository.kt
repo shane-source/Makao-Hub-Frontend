@@ -1,5 +1,6 @@
 package com.makaohub.android.data
 
+import com.google.gson.annotations.SerializedName
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
@@ -12,10 +13,20 @@ import java.util.concurrent.TimeUnit
 data class LandlordSummary(val totalListings: Long, val draftListings: Long, val publishedListings: Long)
 data class OwnerListing(val id: String, val title: String, val description: String, val propertyType: String,
     val monthlyRentKes: Long, val bedroomCount: Int, val bathroomCount: Int, val furnished: Boolean,
-    val availableFrom: String?, val status: String, val createdAt: String, val updatedAt: String)
+    val availableFrom: String?, val status: String, val createdAt: String, val updatedAt: String,
+    val depositKes: Long? = null, val waterAvailable: Boolean? = null, val securityAvailable: Boolean? = null,
+    val parkingAvailable: Boolean? = null, val balcony: Boolean? = null, val petsAllowed: Boolean? = null)
+data class OwnerListingReview(val id: String, val status: String,
+    @SerializedName("moderation_status") val moderationStatus: String,
+    @SerializedName("moderation_reason") val moderationReason: String? = null,
+    @SerializedName("moderation_submitted_at") val moderationSubmittedAt: String? = null,
+    @SerializedName("moderation_reviewed_at") val moderationReviewedAt: String? = null,
+    @SerializedName("updated_at") val updatedAt: String)
 class ListingDraft(val title: String, val description: String, val propertyType: String,
     val monthlyRentKes: Long, val bedroomCount: Int, val bathroomCount: Int, val furnished: Boolean,
-    val availableFrom: String?)
+    val availableFrom: String?, val depositKes: Long = 0, val waterAvailable: Boolean? = false,
+    val securityAvailable: Boolean? = false, val parkingAvailable: Boolean? = false,
+    val balcony: Boolean? = false, val petsAllowed: Boolean? = false)
 // Private location and signed URL models have no generated toString().
 class OwnerLocation(val areaLabel: String, val latitude: BigDecimal, val longitude: BigDecimal)
 data class OwnerMedia(val id: String, val listingId: String, val mediaType: String, val contentType: String,
@@ -32,9 +43,13 @@ data class OwnerMessage(val id: String, val threadId: String, val senderId: Stri
 data class OwnerMessagePage(val items: List<OwnerMessage>, val nextCursor: String?, val hasNext: Boolean)
 class OwnerPayment(val id: String, val paymentType: String, val targetKind: String, val listingId: String?,
     val bookingId: String?, val amountMinor: Long, val currency: String, val status: String,
-    val providerReference: String?, val createdAt: String, val completedAt: String?)
+    val providerReference: String?, val createdAt: String, val completedAt: String?,
+    val authorizationUrl: String? = null, val providerAccessCode: String? = null,
+    val providerDisplayText: String? = null)
 class OwnerCheckout(val paymentType: String, val listingId: String?, val bookingId: String? = null)
 class MockCompletion(val providerReference: String, val outcome: String)
+class PaystackReconcileBody(val reference: String)
+class OwnerApplicationRejection(val reason: String)
 class MediaTransferFailed : Exception()
 class OwnerVerification(val status: String, val submittedAt: String?, val reviewedAt: String?, val rejectionReason: String?)
 class OwnerVerificationDocument(val documentId: String, val documentType: String, val status: String,
@@ -93,9 +108,24 @@ class LandlordRepository(private val auth: AuthRepository) {
     suspend fun save(id: String?, draft: ListingDraft) = auth.authorized("LANDLORD") { api, h ->
         if (id == null) api.createListing(h, draft) else api.updateListing(h, id, draft)
     }
+    suspend fun deleteDraft(id: String) = auth.authorized("LANDLORD") { api, h ->
+        val response = api.deleteListingDraft(h, id)
+        if (!response.isSuccessful) throw retrofit2.HttpException(response)
+    }
     suspend fun transition(id: String, action: String) = auth.authorized("LANDLORD") { api, h ->
         when (action) { "publish" -> api.publishListing(h, id); "pause" -> api.pauseListing(h, id)
             "resume" -> api.resumeListing(h, id); else -> error("Unsupported listing action") }
+    }
+    suspend fun review(id: String) = auth.authorized("LANDLORD") { api, h -> api.landlordListingReview(h, id) }
+    suspend fun submitReview(id: String) = auth.authorized("LANDLORD") { api, h ->
+        val response=api.submitLandlordListingReview(h,id)
+        if (!response.isSuccessful) throw retrofit2.HttpException(response)
+        api.landlordListingReview(h,id)
+    }
+    suspend fun reviseReview(id: String) = auth.authorized("LANDLORD") { api, h ->
+        val response=api.reviseLandlordListingReview(h,id)
+        if (!response.isSuccessful) throw retrofit2.HttpException(response)
+        api.landlordListingReview(h,id)
     }
     suspend fun location(id: String) = auth.authorized("LANDLORD") { api, h -> api.ownerLocation(h, id) }
     suspend fun saveLocation(id: String, location: OwnerLocation) = auth.authorized("LANDLORD") { api, h -> api.saveLocation(h, id, location) }
@@ -107,9 +137,9 @@ class LandlordRepository(private val auth: AuthRepository) {
         if (!result.isSuccessful) throw retrofit2.HttpException(result)
     }
     suspend fun applications() = auth.authorized("LANDLORD") { api, h -> api.landlordApplications(h) }
-    suspend fun decide(id: String, action: String) = auth.authorized("LANDLORD") { api, h ->
+    suspend fun decide(id: String, action: String, reason: String? = null) = auth.authorized("LANDLORD") { api, h ->
         when(action) { "review" -> api.reviewApplication(h, id); "approve" -> api.approveApplication(h, id)
-            "reject" -> api.rejectApplication(h, id); else -> error("Unsupported application action") }
+            "reject" -> api.rejectApplication(h, id, OwnerApplicationRejection(requireNotNull(reason))); else -> error("Unsupported application action") }
     }
     suspend fun threads(page: Int = 0) = auth.authorized("LANDLORD") { api, h -> api.landlordThreads(h, page) }
     suspend fun messages(id: String, cursor: String? = null) = auth.authorized("LANDLORD") { api, h -> api.landlordMessages(h, id, cursor) }

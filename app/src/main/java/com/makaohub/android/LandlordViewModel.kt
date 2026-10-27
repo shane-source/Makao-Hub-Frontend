@@ -24,7 +24,7 @@ import java.math.BigDecimal
 import java.time.LocalDate
 import java.util.UUID
 
-enum class OwnerScreen { HOME, VERIFICATION, LISTINGS, EDIT, MEDIA, LOCATION, PREVIEW, CHECKS, APPLICATIONS, APPLICATION, MESSAGES, CHAT, PAYMENTS, PAYOUT, PLANS, BOOST, PROFILE }
+enum class OwnerScreen { HOME, VERIFICATION, LISTINGS, EDIT, MEDIA, MEDIA_MANAGE, LOCATION, PREVIEW, CHECKS, APPLICATIONS, APPLICATION, APPLICATION_DECISION, MESSAGES, CHAT, PAYMENTS, PLANS, BOOST, PROFILE }
 
 internal fun nextMediaSortOrder(records: List<OwnerMedia>): Int {
     val used = records.mapTo(HashSet()) { it.sortOrder }
@@ -32,19 +32,30 @@ internal fun nextMediaSortOrder(records: List<OwnerMedia>): Int {
 }
 
 data class ListingForm(val title: String = "", val description: String = "", val propertyType: String = "APARTMENT",
-    val rent: String = "", val bedrooms: String = "1", val bathrooms: String = "1", val furnished: Boolean = false, val available: String = "") {
+    val rent: String = "", val deposit: String = "", val bedrooms: String = "1", val bathrooms: String = "1",
+    val waterAvailable: Boolean? = false, val securityAvailable: Boolean? = false,
+    val parkingAvailable: Boolean? = false, val balcony: Boolean? = false,
+    val furnished: Boolean = false, val petsAllowed: Boolean? = false, val available: String = "") {
     fun error(): String? = when {
         title.trim().isEmpty() || title.trim().length > 150 -> "Enter a title of up to 150 characters."
         description.trim().isEmpty() || description.trim().length > 3000 -> "Enter a description of up to 3,000 characters."
         propertyType !in listOf("APARTMENT", "HOUSE", "STUDIO", "BEDSITTER", "ROOM") -> "Select a supported property type."
         rent.toLongOrNull()?.let { it > 0 } != true -> "Enter a positive monthly rent in whole KSh."
+        deposit.toLongOrNull()?.let { it >= 0 } != true -> "Enter a deposit of zero or more in whole KSh."
         bedrooms.toIntOrNull() !in 0..20 -> "Bedrooms must be between 0 and 20."
         bathrooms.toIntOrNull() !in 1..20 -> "Bathrooms must be between 1 and 20."
         available.isNotBlank() && runCatching { LocalDate.parse(available) }.isFailure -> "Use YYYY-MM-DD for the availability date."
         else -> null
     }
-    fun request() = ListingDraft(title.trim(), description.trim(), propertyType, rent.toLong(), bedrooms.toInt(), bathrooms.toInt(), furnished, available.ifBlank { null })
-    companion object { fun from(l: OwnerListing) = ListingForm(l.title, l.description, l.propertyType, l.monthlyRentKes.toString(), l.bedroomCount.toString(), l.bathroomCount.toString(), l.furnished, l.availableFrom ?: "") }
+    fun request() = ListingDraft(title.trim(), description.trim(), propertyType, rent.toLong(), bedrooms.toInt(),
+        bathrooms.toInt(), furnished, available.ifBlank { null }, deposit.toLong(), waterAvailable,
+        securityAvailable, parkingAvailable, balcony, petsAllowed)
+    companion object { fun from(l: OwnerListing) = ListingForm(title = l.title, description = l.description,
+        propertyType = l.propertyType, rent = l.monthlyRentKes.toString(), deposit = l.depositKes?.toString().orEmpty(),
+        bedrooms = l.bedroomCount.toString(), bathrooms = l.bathroomCount.toString(),
+        waterAvailable = l.waterAvailable, securityAvailable = l.securityAvailable,
+        parkingAvailable = l.parkingAvailable, balcony = l.balcony, furnished = l.furnished,
+        petsAllowed = l.petsAllowed, available = l.availableFrom ?: "") }
 }
 
 /** Keeps private owner data in memory and only reflects states confirmed by the server. */
@@ -60,14 +71,19 @@ class LandlordViewModel(private val repository: LandlordRepository, private val 
     private var verificationTransferred = false
     var verificationPendingId by mutableStateOf<String?>(null); private set
     var evidenceStage by mutableStateOf<String?>(null); private set
+    var evidenceProgress by mutableStateOf<Int?>(null); private set
+    val pendingEvidenceType: String? get() = verificationTicket?.documentType
     val evidencePreviews = mutableStateMapOf<OwnerEvidence, ByteArray>()
     val evidenceNames = mutableStateMapOf<OwnerEvidence, String>()
     var listings by mutableStateOf<List<OwnerListing>>(emptyList()); private set
     var applications by mutableStateOf<List<OwnerApplication>>(emptyList()); private set
     var applicationsLoaded by mutableStateOf(false); private set
     var selected by mutableStateOf<OwnerListing?>(null); private set
+    var listingReview by mutableStateOf<OwnerListingReview?>(null); private set
     var form by mutableStateOf(ListingForm())
     var media by mutableStateOf<List<OwnerMedia>>(emptyList()); private set
+    var selectedMediaId by mutableStateOf<String?>(null); private set
+    var mediaUploadError by mutableStateOf<String?>(null); private set
     var location by mutableStateOf<OwnerLocation?>(null); private set
     var selectedApplication by mutableStateOf<OwnerApplication?>(null); private set
     var threads by mutableStateOf<OwnerPage<OwnerThread>?>(null); private set
@@ -82,6 +98,8 @@ class LandlordViewModel(private val repository: LandlordRepository, private val 
     private var upload: MediaUploadTicket? = null
     private var uploadUri: Uri? = null
     private var uploaded = false
+    private var replacingMediaId: String? = null
+    val mediaUploadPending: Boolean get() = upload != null
     var pendingConfirmationId by mutableStateOf<String?>(null); private set
     private var socket: RentalChatSocket? = null
     private var clientMessageId: String? = null
@@ -103,6 +121,12 @@ class LandlordViewModel(private val repository: LandlordRepository, private val 
             OwnerScreen.APPLICATIONS -> run { applications = repository.applications(); applicationsLoaded = true }
             OwnerScreen.MESSAGES -> loadThreads()
             OwnerScreen.PAYMENTS -> loadPayments()
+            OwnerScreen.CHECKS -> run {
+                val id=requireNotNull(selected).id
+                listingReview = repository.review(id)
+                media = repository.media(id)
+                location = try { repository.location(id) } catch (e: HttpException) { if (e.code() == 404) null else throw e }
+            }
             else -> Unit
         }
     }
@@ -118,23 +142,24 @@ class LandlordViewModel(private val repository: LandlordRepository, private val 
         verification = repository.verification()
         verificationDocuments = repository.verificationDocuments()
     }
+    /** Reads only the owner's saved decision; acknowledging a document never approves the role. */
+    fun refreshReviewStatus() {
+        if (busy || verification?.status != "PENDING" || screen !in listOf(OwnerScreen.HOME, OwnerScreen.VERIFICATION)) return
+        run {
+            val latest = repository.verification()
+            verification = latest
+            if (latest.status in listOf("VERIFIED", "REJECTED")) screen = OwnerScreen.VERIFICATION
+        }
+    }
     fun uploadEvidence(type: OwnerEvidence, resolver: ContentResolver, uri: Uri) = run {
         // Keep display names only in this session; never persist or log document names.
-        val displayName = withContext(Dispatchers.IO) {
-            runCatching {
-                resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
-                    val index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-                    if (cursor.moveToFirst() && index >= 0) cursor.getString(index) else null
-                }
-            }.getOrNull()
-        }
-        displayName?.let { name -> evidenceNames[type] = name.filter { !it.isISOControl() }.take(120) }
+        val displayName = withContext(Dispatchers.IO) { evidenceDisplayName(resolver, uri) }
         evidenceStage = if (type == OwnerEvidence.OWNERSHIP_PROOF) "Reading PDF" else "Preparing image"
         val bytes = withContext(Dispatchers.IO) {
             if (type == OwnerEvidence.OWNERSHIP_PROOF) VerificationDocuments.fromUri(resolver, uri)
             else VerificationImages.fromUri(resolver, uri)
         }
-        beginEvidence(type, bytes)
+        beginEvidence(type, bytes, displayName)
     }
     fun uploadSelfie(bitmap: Bitmap) = uploadCameraEvidence(OwnerEvidence.SELFIE, bitmap)
     fun uploadCameraEvidence(type: OwnerEvidence, bitmap: Bitmap) {
@@ -147,36 +172,39 @@ class LandlordViewModel(private val repository: LandlordRepository, private val 
         run {
             try {
                 if (type == OwnerEvidence.OWNERSHIP_PROOF) return@run
-                evidenceNames[type] = when (type) {
+                val displayName = when (type) {
                     OwnerEvidence.ID_FRONT -> "national_id_front.jpg"
                     OwnerEvidence.ID_BACK -> "national_id_back.jpg"
                     else -> "selfie_capture.jpg"
                 }
                 evidenceStage = "Preparing photo"
                 val bytes = withContext(Dispatchers.IO) { VerificationImages.fromBitmap(bitmap) }
-                beginEvidence(type, bytes)
+                beginEvidence(type, bytes, displayName)
             } finally {
                 bitmap.recycle()
             }
         }
     }
-    private suspend fun beginEvidence(type: OwnerEvidence, bytes: ByteArray) {
-        if (verificationTicket != null) {
-            notice = "Finish or retry the current document before choosing another."; return
-        }
+    internal suspend fun beginEvidence(type: OwnerEvidence, bytes: ByteArray, displayName: String? = null) {
         if (verification?.status !in listOf("NOT_STARTED", "REJECTED")) {
-            notice = "Refresh your verification status before uploading."; return
+            bytes.fill(0); notice = "Refresh your verification status before uploading."; return
         }
-        val replacing = verificationDocuments.any { it.documentType == type.name }
-        val ticket = repository.verificationTicket(type, replacing)
+        // A new file needs a new immutable object, even after a failed or uncertain confirmation.
+        // Keep the previous file retryable until the replacement ticket succeeds.
+        val ticket = try { repository.verificationTicket(type, true) }
+        catch (failure: Exception) { bytes.fill(0); throw failure }
         if (ticket.documentType != type.name || ticket.contentType != type.uploadContentType) {
-            notice = "The saved upload uses a different format. Contact support before replacing it."; return
+            bytes.fill(0); notice = "The saved upload uses a different format. Contact support before replacing it."; return
         }
+        verificationBytes?.fill(0)
+        evidencePreviews.remove(type)?.fill(0)
+        evidenceNames.remove(type)
+        displayName?.let { evidenceNames[type] = it }
+        verificationDocuments = verificationDocuments.filterNot { it.documentType == type.name }
         verificationTicket = ticket; verificationBytes = bytes
-        if (type != OwnerEvidence.OWNERSHIP_PROOF) {
-            withContext(Dispatchers.IO) { VerificationImages.thumbnail(bytes) }?.let { evidencePreviews[type] = it }
-        }
-        verificationTransferred = false; verificationPendingId = ticket.documentId
+        verificationTransferred = false; verificationPendingId = ticket.documentId; evidenceProgress = null
+        // Only the live-photo screen needs a thumbnail; ID screens deliberately expose no preview.
+        if (type == OwnerEvidence.SELFIE) withContext(Dispatchers.IO) { VerificationImages.thumbnail(bytes) }?.let { evidencePreviews[type] = it }
         finishEvidenceUpload()
     }
     fun retryEvidence() = run {
@@ -196,7 +224,9 @@ class LandlordViewModel(private val repository: LandlordRepository, private val 
         val ticket = verificationTicket ?: return
         if (!verificationTransferred) {
             evidenceStage = "Uploading file"
-            repository.transferVerification(ticket, requireNotNull(verificationBytes).toRequestBody(ticket.contentType.toMediaType()))
+            repository.transferVerification(ticket, EvidenceUploadBody(requireNotNull(verificationBytes), ticket.contentType.toMediaType()) {
+                if (verificationPendingId == ticket.documentId) evidenceProgress = it
+            })
             verificationTransferred = true
         }
         evidenceStage = if (ticket.contentType == "application/pdf") "Security-checking PDF" else "Confirming image"
@@ -204,6 +234,7 @@ class LandlordViewModel(private val repository: LandlordRepository, private val 
         verificationBytes?.fill(0)
         verificationTicket = null; verificationBytes = null
         verificationTransferred = false; verificationPendingId = null
+        evidenceProgress = null
         notice = null
     }
     fun confirmSavedEvidence(id: String) = run {
@@ -212,6 +243,7 @@ class LandlordViewModel(private val repository: LandlordRepository, private val 
         if (verificationPendingId == id) {
             verificationBytes?.fill(0)
             verificationTicket = null; verificationBytes = null; verificationTransferred = false; verificationPendingId = null
+            evidenceProgress = null
         }
         notice = null
     }
@@ -252,26 +284,84 @@ class LandlordViewModel(private val repository: LandlordRepository, private val 
         if (busy) return
         selected = listing; form = ListingForm.from(listing); resetEditor(); screen = OwnerScreen.EDIT
     }
-    private fun resetEditor() { notice = null; media = emptyList(); location = null; upload = null; uploadUri = null; uploaded = false; pendingConfirmationId = null }
+    fun manage(listing: OwnerListing) {
+        if (busy) return
+        selected = listing; form = ListingForm.from(listing); resetEditor()
+        run {
+            listingReview = repository.review(listing.id)
+            screen = if (listing.status == "DRAFT" && listingReview?.moderationStatus == "PENDING"
+                && listingReview?.moderationSubmittedAt == null) OwnerScreen.EDIT else OwnerScreen.CHECKS
+            if (screen == OwnerScreen.CHECKS) {
+                media = repository.media(listing.id)
+                location = try { repository.location(listing.id) } catch (e: HttpException) { if (e.code() == 404) null else throw e }
+            }
+        }
+    }
+    private fun resetEditor() { notice = null; media = emptyList(); selectedMediaId = null; mediaUploadError = null; location = null; listingReview = null; upload = null; uploadUri = null; uploaded = false; replacingMediaId = null; pendingConfirmationId = null }
     fun saveDraft(next: Boolean) {
         form.error()?.let { notice = it; return }
         run {
             selected = repository.save(selected?.id, form.request())
+            listingReview = null
             notice = "Draft saved. It is not visible in public search."
             if (next) { media = repository.media(selected!!.id); screen = OwnerScreen.MEDIA }
         }
     }
     fun loadMedia() = run { media = repository.media(requireNotNull(selected).id); screen = OwnerScreen.MEDIA }
+    fun deleteDraft(listing: OwnerListing) {
+        if (listing.status != "DRAFT") {
+            notice = "Only draft listings can be deleted."
+            return
+        }
+        run {
+            repository.deleteDraft(listing.id)
+            listings = listings.filterNot { it.id == listing.id }
+            summary = summary?.let {
+                it.copy(
+                    totalListings = (it.totalListings - 1).coerceAtLeast(0),
+                    draftListings = (it.draftListings - 1).coerceAtLeast(0)
+                )
+            }
+            if (selected?.id == listing.id) {
+                selected = null
+                form = ListingForm()
+                resetEditor()
+            }
+            notice = "Draft deleted."
+        }
+    }
+    fun selectMedia(id: String) {
+        if (!busy && media.any { it.id == id }) selectedMediaId = id
+    }
+    fun manageMedia(id: String) {
+        if (!busy && media.any { it.id == id }) { selectedMediaId = id; screen = OwnerScreen.MEDIA_MANAGE }
+    }
     fun removeMedia(id: String) = run {
         repository.remove(requireNotNull(selected).id, id)
+        listingReview = null
         localPhotos.remove(id)
+        // DELETE succeeded. Do not invite a second deletion if the metadata refresh fails.
+        media = media.filterNot { it.id == id }
+        if (selectedMediaId == id) selectedMediaId = null
+        if (screen == OwnerScreen.MEDIA_MANAGE) screen = OwnerScreen.MEDIA
+        if (upload?.mediaId == id) { upload = null; uploadUri = null; uploaded = false; replacingMediaId = null; pendingConfirmationId = null }
         media = repository.media(requireNotNull(selected).id)
-        if (upload?.mediaId == id) { upload = null; uploadUri = null; uploaded = false; pendingConfirmationId = null }
+        mediaUploadError = null
         notice = "Media removed from this draft."
     }
-    fun uploadFile(resolver: ContentResolver, uri: Uri) = run {
+    fun uploadFile(resolver: ContentResolver, uri: Uri) = startMediaUpload(resolver, uri, null)
+    fun replacePhoto(resolver: ContentResolver, uri: Uri) {
+        val selectedId = selectedMediaId ?: return
+        val selectedMedia = media.find { it.id == selectedId } ?: return
+        if (selectedMedia.mediaType != "IMAGE") {
+            notice = "Only photos can be replaced here."
+            return
+        }
+        startMediaUpload(resolver, uri, selectedId)
+    }
+    private fun startMediaUpload(resolver: ContentResolver, uri: Uri, replacementId: String?) = run {
         val listing = requireNotNull(selected)
-        if (pendingConfirmationId != null) { notice = "Confirm the previous upload before adding another file."; return@run }
+        mediaUploadError = null
         val (mime, size) = withContext(Dispatchers.IO) {
             val contentType = resolver.getType(uri)?.lowercase() ?: ""
             val fileSize = resolver.query(uri, arrayOf(OpenableColumns.SIZE), null, null, null)?.use { cursor ->
@@ -282,20 +372,32 @@ class LandlordViewModel(private val repository: LandlordRepository, private val 
         val type = if (mime in listOf("image/jpeg", "image/png", "image/webp")) "IMAGE" else if (mime == "video/mp4") "VIDEO" else {
             notice = "Choose a JPEG, PNG, WebP image or MP4 video."; return@run
         }
+        if (replacementId != null && type != "IMAGE") {
+            notice = "Choose a JPEG, PNG or WebP photo as the replacement."; return@run
+        }
         if (size !in 1..52428800L) { notice = "Choose a file with a known size of at most 50 MB. The server applies additional image limits."; return@run }
+        if (upload != null && uploadUri != uri) {
+            repository.remove(listing.id, requireNotNull(upload).mediaId)
+            upload = null; uploadUri = null; uploaded = false; pendingConfirmationId = null
+        }
         if (upload == null || uploadUri != uri) {
             media = repository.media(listing.id)
             upload = repository.uploadTicket(listing.id, MediaUploadRequest(type, mime, size, nextMediaSortOrder(media)))
-            uploadUri = uri; uploaded = false
+            uploadUri = uri; uploaded = false; replacingMediaId = replacementId
         }
-        val ticket = requireNotNull(upload)
+        transferPendingUpload(resolver)
+        confirmPendingUpload()
+    }
+    private suspend fun transferPendingUpload(resolver: ContentResolver) {
+        val ticket = upload ?: return
+        val uri = uploadUri ?: return
         if (!uploaded) {
             val body = object : RequestBody() {
-                override fun contentType() = mime.toMediaType()
-                override fun contentLength() = size
+                override fun contentType() = ticket.contentType.toMediaType()
+                override fun contentLength() = ticket.sizeBytes
                 override fun writeTo(sink: BufferedSink) {
                     resolver.openInputStream(uri)?.use { input -> input.source().buffer().use { source ->
-                        var remaining = size
+                        var remaining = ticket.sizeBytes
                         while (remaining > 0) {
                             val count = source.read(sink.buffer, minOf(remaining, 8192))
                             if (count == -1L) throw MediaTransferFailed()
@@ -307,17 +409,29 @@ class LandlordViewModel(private val repository: LandlordRepository, private val 
             }
             repository.transfer(ticket, body); uploaded = true; pendingConfirmationId = ticket.mediaId
         }
-        confirmPendingUpload()
     }
     fun retryConfirmation() = run { confirmPendingUpload() }
+    fun retryMediaUpload(resolver: ContentResolver) = run {
+        mediaUploadError = null
+        transferPendingUpload(resolver)
+        confirmPendingUpload()
+    }
     private suspend fun confirmPendingUpload() {
         val ticket = upload ?: return
         if (!uploaded) return
         val listingId = requireNotNull(selected).id
         repository.confirm(listingId, ticket.mediaId)
+        listingReview = null
+        replacingMediaId?.let { oldMediaId ->
+            if (oldMediaId != ticket.mediaId) repository.remove(listingId, oldMediaId)
+            localPhotos.remove(oldMediaId)
+        }
         if (ticket.mediaType == "IMAGE") uploadUri?.let { localPhotos[ticket.mediaId] = it }
-        upload = null; uploadUri = null; uploaded = false; pendingConfirmationId = null
+        selectedMediaId = ticket.mediaId
+        upload = null; uploadUri = null; uploaded = false; replacingMediaId = null; pendingConfirmationId = null
         media = repository.media(listingId)
+        mediaUploadError = null
+        if (screen == OwnerScreen.MEDIA_MANAGE) screen = OwnerScreen.MEDIA
         notice = "Upload confirmed by the server."
     }
     fun openLocation() = run {
@@ -331,7 +445,7 @@ class LandlordViewModel(private val repository: LandlordRepository, private val 
             || lat < BigDecimal("-5") || lat > BigDecimal("5.5") || lng < BigDecimal("33") || lng > BigDecimal("42.5")) {
             notice = "Enter a public neighborhood or area label and select a supported property pin."; return
         }
-        run { location = repository.saveLocation(requireNotNull(selected).id, OwnerLocation(area.trim(), lat, lng)); screen = OwnerScreen.PREVIEW; notice = "Private location saved." }
+        run { location = repository.saveLocation(requireNotNull(selected).id, OwnerLocation(area.trim(), lat, lng)); listingReview = null; screen = OwnerScreen.PREVIEW; notice = "Private location saved." }
     }
     fun saveMapLocation(area: String, latitude: Double, longitude: Double) {
         if (!validOwnerPin(latitude, longitude)) {
@@ -339,15 +453,36 @@ class LandlordViewModel(private val repository: LandlordRepository, private val 
         }
         saveLocation(area, BigDecimal.valueOf(latitude).toPlainString(), BigDecimal.valueOf(longitude).toPlainString())
     }
-    fun listingAction(action: String) = run {
+    fun submitListingReview() = run {
+        listingReview = repository.submitReview(requireNotNull(selected).id)
+        screen = OwnerScreen.CHECKS
+        notice = "Listing submitted for staff review."
+    }
+    fun reviseListingReview() = run {
+        val id=requireNotNull(selected).id
+        listingReview = repository.reviseReview(id)
+        listings = repository.listings()
+        selected = listings.first { it.id == id }
+        form = ListingForm.from(requireNotNull(selected))
+        screen = OwnerScreen.EDIT
+        notice = "Update the listing, then submit it for review again."
+    }
+    fun listingAction(action: String) {
+        if (action == "publish" && listingReview?.moderationStatus != "APPROVED") {
+            notice = "Staff approval is required before publication."
+            return
+        }
+        run {
         selected = repository.transition(requireNotNull(selected).id, action)
+        listingReview = repository.review(requireNotNull(selected).id)
         listings = repository.listings()
         screen = OwnerScreen.CHECKS
         notice = when(action) { "pause" -> "Listing paused. It is hidden from discovery."; "resume" -> "Published listing resumed."; else -> "Published. Exact coordinates remain protected by the server." }
+        }
     }
     fun viewApplication(application: OwnerApplication) { if (!busy) { selectedApplication = application; notice = null; screen = OwnerScreen.APPLICATION } }
-    fun decision(action: String) = run {
-        selectedApplication = repository.decide(requireNotNull(selectedApplication).id, action)
+    fun decision(action: String, reason: String? = null) = run {
+        selectedApplication = repository.decide(requireNotNull(selectedApplication).id, action, reason)
         applications = repository.applications()
         notice = "Application ${requireNotNull(selectedApplication).status.lowercase().replace('_',' ')}. The server recorded the decision."
     }
@@ -421,6 +556,10 @@ class LandlordViewModel(private val repository: LandlordRepository, private val 
             catch (cancel: CancellationException) { throw cancel }
             catch (e: Exception) {
                 if (e is SessionExpired || e is WorkspaceUnavailable) { clearPrivateState(); sessionExpired() }
+                if (screen in listOf(OwnerScreen.MEDIA, OwnerScreen.MEDIA_MANAGE)
+                    && (upload != null || e is MediaTransferFailed)) {
+                    mediaUploadError = "This photo could not be uploaded. Retry or replace it; your other media is saved."
+                }
                 notice = if (e is VerificationImageRejected || e is VerificationPdfRejected) e.message
                     else if (e is MediaTransferFailed && screen == OwnerScreen.VERIFICATION) "Document upload did not complete. Retry the current document; no approval has been granted."
                     else if (e is MediaTransferFailed) "Media upload was not completed. Your other saved media is unchanged. Select the same file to retry."
@@ -429,7 +568,7 @@ class LandlordViewModel(private val repository: LandlordRepository, private val 
                         403 -> "Your role, verification or ownership does not permit this action."
                         404 -> "The requested listing, file or application is unavailable to this account."
                         409 -> "This action conflicts with the saved state. Refresh and check the publish or decision requirements."
-                        503 -> if (screen == OwnerScreen.VERIFICATION) "Document security validation is unavailable. Nothing has been approved; check the backend scanner setup, then retry confirmation." else friendlyError(e)
+                        503 -> if (screen == OwnerScreen.VERIFICATION && verificationPendingId != null) "Document security validation is unavailable. Nothing has been approved; check the backend scanner setup, then retry confirmation." else friendlyError(e)
                         else -> friendlyError(e)
                     }
                     else friendlyError(e)
@@ -440,12 +579,12 @@ class LandlordViewModel(private val repository: LandlordRepository, private val 
         generation++; work?.cancel(); work = null; busy = false
         verificationBytes?.fill(0)
         verification = null; verificationDocuments = emptyList(); verificationTicket = null; verificationBytes = null
-        verificationTransferred = false; verificationPendingId = null
+        verificationTransferred = false; verificationPendingId = null; evidenceProgress = null
         evidencePreviews.values.forEach { it.fill(0) }; evidencePreviews.clear(); evidenceNames.clear(); evidenceStage = null
-        disconnectChat(); location = null; media = emptyList(); localPhotos.clear(); upload = null; uploadUri = null
-        uploaded = false; pendingConfirmationId = null; summary = null; threads = null; applicationsLoaded = false
+        disconnectChat(); location = null; media = emptyList(); selectedMediaId = null; mediaUploadError = null; localPhotos.clear(); upload = null; uploadUri = null
+        uploaded = false; replacingMediaId = null; pendingConfirmationId = null; summary = null; threads = null; applicationsLoaded = false
         thread = null; messages = null; chatDraft = ""; clientMessageId = null; checkout = null; payments = null
-        listings = emptyList(); applications = emptyList(); selected = null; selectedApplication = null; form = ListingForm()
+        listings = emptyList(); applications = emptyList(); selected = null; listingReview = null; selectedApplication = null; form = ListingForm()
         checkoutListingId = null; checkoutKey = UUID.randomUUID().toString(); checkoutType = "PLAN_UPGRADE"
         notice = null; screen = OwnerScreen.HOME
     }
