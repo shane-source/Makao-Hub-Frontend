@@ -1,6 +1,8 @@
 package com.makaohub.android
 
+import android.content.Intent
 import android.os.Bundle
+import android.os.SystemClock
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.BackHandler
@@ -18,21 +20,72 @@ import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelProvider
+import androidx.compose.ui.platform.LocalContext
+import com.makaohub.android.data.AndroidSessionStore
+import com.makaohub.android.data.OfflineHomes
+import com.makaohub.android.data.AuthRepository
+import com.makaohub.android.data.createMakaoApi
 import com.makaohub.android.ui.*
 import kotlinx.coroutines.delay
 
 class MainActivity : ComponentActivity() {
+    private var checkoutReturnSignal by mutableIntStateOf(0)
+    internal var activityListener: (() -> Unit)? = null
+
+    override fun onUserInteraction() {
+        super.onUserInteraction()
+        activityListener?.invoke()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        activityListener?.invoke()
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge(statusBarStyle = SystemBarStyle.light(android.graphics.Color.TRANSPARENT,
             android.graphics.Color.TRANSPARENT))
-        setContent { MakaoApp() }
+        if (isPaystackReturnUri(intent?.dataString)) checkoutReturnSignal++
+        setContent {
+            CompositionLocalProvider(LocalCheckoutReturnSignal provides checkoutReturnSignal) { MakaoApp() }
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        if (isPaystackReturnUri(intent.dataString)) checkoutReturnSignal++
     }
 }
 
 /** Routes only through the current ViewModel; backend responses own authenticated state. */
 @Composable
-private fun MakaoApp(model: AuthViewModel = viewModel()) {
+private fun MakaoApp() {
+    val context = LocalContext.current.applicationContext
+    val factory = remember(context) { object : ViewModelProvider.Factory {
+        @Suppress("UNCHECKED_CAST") override fun <T : ViewModel> create(modelClass: Class<T>): T =
+            AuthViewModel(AuthRepository(createMakaoApi(BuildConfig.API_BASE_URL), AndroidSessionStore(context)), OfflineHomes(context, BuildConfig.API_BASE_URL), LaunchMemory(context)) as T
+    } }
+    val model: AuthViewModel = viewModel(factory = factory)
+    val activity = LocalContext.current as? MainActivity
+    DisposableEffect(activity, model) {
+        val listener = { model.noteUserActivity(System.currentTimeMillis(), SystemClock.elapsedRealtime()) }
+        activity?.activityListener = listener
+        onDispose { if (activity?.activityListener === listener) activity.activityListener = null }
+    }
+    LaunchedEffect(model.profile?.id, model.profile?.role) { model.rememberSignedInUser() }
+    LaunchedEffect(model.page, model.profile?.id, model.offlineSession) {
+        if ((model.page == Page.ACCOUNT && model.profile != null) || (model.page == Page.OFFLINE && model.offlineSession)) {
+            model.noteUserActivity(System.currentTimeMillis(), SystemClock.elapsedRealtime())
+            while (true) {
+                delay(1_000)
+                model.checkInactivity(System.currentTimeMillis(), SystemClock.elapsedRealtime())
+            }
+        }
+    }
     val back = {
         model.navigate(when (model.page) {
             Page.WELCOME -> Page.ENTRY
@@ -51,7 +104,7 @@ private fun MakaoApp(model: AuthViewModel = viewModel()) {
         when (model.page) {
             Page.SPLASH -> {
                 LaunchedEffect(Unit) {
-                    delay(2500L)
+                    delay(600L)
                     model.finishSplash()
                 }
                 Box(Modifier.fillMaxSize().clickable(
@@ -62,6 +115,7 @@ private fun MakaoApp(model: AuthViewModel = viewModel()) {
                     Splash(modifier = Modifier.fillMaxSize())
                 }
             }
+            Page.OFFLINE -> OfflineRenterDashboard(model)
             Page.ENTRY -> EntryScreen { model.navigate(Page.WELCOME) }
             Page.WELCOME -> WelcomeScreen(back, { model.navigate(Page.HOMES) }, { model.navigate(Page.ROLE) })
             Page.HOMES -> HomesWalkthrough(back, { model.navigate(Page.PEACE) }, { model.navigate(Page.ROLE) })
@@ -74,23 +128,41 @@ private fun MakaoApp(model: AuthViewModel = viewModel()) {
             Page.RESET -> ResetScreen(model, back)
             Page.ACCOUNT -> {
                 val profile = model.profile
-                if (profile?.role == "LANDLORD") LandlordWorkspace(model, profile)
-                else if (profile?.role == "SUBLESSOR") SublessorWorkspace(model, profile)
-                else if (profile?.role == "RENTER") RenterWorkspace(model, profile)
+                if (model.phoneCompletionRequired) PhoneCompletionScreen(model)
+                else if (profile != null && profile.role in setOf("LANDLORD", "SUBLESSOR", "RENTER")) {
+                    NotificationHost(model, profile) {
+                        when (profile.role) {
+                            "LANDLORD" -> LandlordWorkspace(model, profile)
+                            "SUBLESSOR" -> SublessorWorkspace(model, profile)
+                            "RENTER" -> RenterWorkspace(model, profile)
+                        }
+                    }
+                } else if (profile == null && model.message == null) SigningInLoader()
                 else AccountScreen(model)
             }
         }
     }
 }
 
+/** Shown while the profile loads after sign-in or sign-up, so no account/log out screen flashes. */
+@Composable private fun SigningInLoader() {
+    Surface(color = Cream, modifier = Modifier.fillMaxSize()) {
+        Box(Modifier.fillMaxSize(), contentAlignment = androidx.compose.ui.Alignment.Center) {
+            CircularProgressIndicator(color = Brown)
+        }
+    }
+}
+
 @Composable private fun Splash(modifier: Modifier = Modifier) {
     Box(modifier.fillMaxSize().background(Brown)) {
-        // The owner's artwork includes the logo/headline; preserve it without cropping.
+        // Fill every screen shape. Anchored to the top so the logo and headline always stay visible;
+        // taller or wider phones only trim the lawn at the bottom.
         Image(
             painter = painterResource(R.drawable.makao_splash_screen),
             contentDescription = "Makao Hub. Find Your Dream Home.",
             modifier = Modifier.fillMaxSize(),
-            contentScale = ContentScale.Fit
+            contentScale = ContentScale.Crop,
+            alignment = androidx.compose.ui.Alignment.TopCenter
         )
     }
 }

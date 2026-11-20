@@ -26,12 +26,17 @@ class RenterContractTest {
     private fun respond(body:String,code:Int=200) { server.enqueue(MockResponse().setResponseCode(code).setHeader("Content-Type","application/json").setBody(body)) }
     private suspend fun login(role:String="RENTER") {
         respond("""{"accessToken":"synthetic","refreshToken":"synthetic","role":"$role","userId":"renter"}""")
-        auth.verify("challenge","123456",OtpFlow.LOGIN,SignupRole.valueOf(role));server.takeRequest()
+        auth.verify("challenge","123456",OtpFlow.LOGIN,SignupRole.valueOf(role));(server.takeRequest(10,java.util.concurrent.TimeUnit.SECONDS) ?: error("Expected an HTTP request"))
     }
     private suspend fun idle(model:RenterViewModel) { withTimeout(5000) { while(model.busy) delay(10) } }
     private val homeJson="""{"id":"home","source":"SUBLESSOR","title":"Synthetic shared home","description":"Synthetic","propertyType":"SPARE_ROOM","monthlyRentKes":18000,"bathroomCount":1,"furnished":true,"areaLabel":"Nairobi","approximateLatitude":-1.29,"approximateLongitude":36.82,"approximateRadiusMeters":500}"""
     @Before fun setup() { Dispatchers.setMain(UnconfinedTestDispatcher());server=MockWebServer();server.start();auth=AuthRepository(createMakaoApi(server.url("/").toString()));repo=RenterRepository(auth) }
     @After fun close() { server.shutdown();Dispatchers.resetMain() }
+    @Test fun unavailableDashboardEntersOfflineMode()=runBlocking {
+        login(); respond("{}", 503)
+        val model = RenterViewModel(repo) { fail("Session expired") }
+        try { model.start(); idle(model); assertTrue(model.offline) } finally { model.clear() }
+    }
     @Test fun wrongRoleCannotAccessRenterRecords()=runBlocking {
         login("LANDLORD")
         try { repo.verification();fail("Wrong role") } catch(_:WorkspaceUnavailable) {}
@@ -45,7 +50,7 @@ class RenterContractTest {
         assertFalse(renterEvidenceComplete(ready.map { OwnerVerificationDocument(it.documentId,it.documentType,"READY","image/jpeg") }))
         respond("""{"documentId":"front","documentType":"ID_FRONT","contentType":"image/jpeg","uploadUrl":"http://invalid.test"}""")
         repo.ticket(RenterEvidence.ID_FRONT,true)
-        val request=server.takeRequest()
+        val request=(server.takeRequest(10,java.util.concurrent.TimeUnit.SECONDS) ?: error("Expected an HTTP request"))
         assertEquals("/api/v1/renter/verification/documents/upload-url",request.path)
         val body=JsonParser.parseString(request.body.readUtf8()).asJsonObject
         assertTrue(body["replaceExisting"].asBoolean);assertFalse(body.has("renterId"))
@@ -55,7 +60,8 @@ class RenterContractTest {
         login();respond("""{"items":[$homeJson],"page":1,"hasNext":true}""")
         val page=repo.homes(HomeFilter(area="Nairobi",min="10000",max="22000",source="SUBLESSOR",propertyType="SPARE_ROOM",availableBy="2026-11-01"),1)
         assertEquals("SUBLESSOR",page.items.single().source);assertTrue(page.hasNext)
-        val path=server.takeRequest().path!!
+        val path=(server.takeRequest(10,java.util.concurrent.TimeUnit.SECONDS) ?: error("Expected an HTTP request")).path!!
+        assertTrue(path.contains("area=Nairobi"))
         assertTrue(path.contains("page=1"));assertTrue(path.contains("source=SUBLESSOR"));assertTrue(path.contains("propertyType=SPARE_ROOM"))
         assertTrue(path.contains("availableBy=2026-11-01"));assertFalse(path.contains("renterId"))
         assertNotNull(HomeFilter(min="25000",max="20000").error())
@@ -63,12 +69,25 @@ class RenterContractTest {
         assertNotNull(HomeFilter(propertyType="UNKNOWN").error());assertNotNull(HomeFilter(availableBy="1 November 2026").error())
         assertNull(HomeFilter(propertyType="SPARE_ROOM",availableBy="2026-11-01").error())
     }
+    @Test fun savingAndRemovingAHomeUpdatesTheVisibleHeartOnlyAfterServerSuccess()=runBlocking {
+        login()
+        val model=RenterViewModel(repo) { fail("Session expired") }
+        val home=Gson().fromJson(homeJson,RenterHome::class.java)
+        try {
+            respond("",204); model.save(home); idle(model)
+            assertEquals("PUT",(server.takeRequest(10,java.util.concurrent.TimeUnit.SECONDS) ?: error("Expected an HTTP request")).method); assertTrue(model.isSaved(home))
+            respond("",500); model.save(home,true); idle(model)
+            assertEquals("DELETE",(server.takeRequest(10,java.util.concurrent.TimeUnit.SECONDS) ?: error("Expected an HTTP request")).method); assertTrue(model.isSaved(home))
+            respond("",204); model.save(home,true); idle(model)
+            assertEquals("DELETE",(server.takeRequest(10,java.util.concurrent.TimeUnit.SECONDS) ?: error("Expected an HTTP request")).method); assertFalse(model.isSaved(home))
+        } finally { model.clear() }
+    }
     @Test fun listingReportUsesServerOwnedReporterAndTypedListingKind()=runBlocking {
         login();respond("""{"reportId":"report","state":"OPEN"}""")
         val home=Gson().fromJson(homeJson,RenterHome::class.java)
         val result=repo.report(home,"MISLEADING_CONTENT","Details do not match the viewing information.")
         assertEquals("OPEN",result.state)
-        val request=server.takeRequest();assertEquals("/api/v1/reports",request.path)
+        val request=(server.takeRequest(10,java.util.concurrent.TimeUnit.SECONDS) ?: error("Expected an HTTP request"));assertEquals("/api/v1/reports",request.path)
         val body=JsonParser.parseString(request.body.readUtf8()).asJsonObject
         assertEquals("SHARED_LISTING",body["subjectKind"].asString);assertEquals("home",body["subjectId"].asString)
         assertFalse(body.has("reporterId"));assertFalse(body.has("ownerId"))
@@ -77,12 +96,12 @@ class RenterContractTest {
         login();respond("""{"status":"NOT_STARTED"}""");respond("[]")
         val m=RenterViewModel(repo) { fail("Session expired") }
         try {
-            m.start();idle(m);server.takeRequest();server.takeRequest()
+            m.start();idle(m);(server.takeRequest(10,java.util.concurrent.TimeUnit.SECONDS) ?: error("Expected an HTTP request"));(server.takeRequest(10,java.util.concurrent.TimeUnit.SECONDS) ?: error("Expected an HTTP request"))
             val first=byteArrayOf(1,2);val second=byteArrayOf(3,4)
             for((id,bytes) in listOf("first" to first,"second" to second)) {
                 respond("""{"documentId":"$id","documentType":"ID_FRONT","contentType":"image/jpeg","uploadUrl":"http://invalid.test/not-storage"}""")
                 try { m.beginEvidence(RenterEvidence.ID_FRONT,bytes);fail("Unsafe URL") } catch(_:IllegalArgumentException) {}
-                assertEquals(id,m.pendingEvidence);server.takeRequest()
+                assertEquals(id,m.pendingEvidence);(server.takeRequest(10,java.util.concurrent.TimeUnit.SECONDS) ?: error("Expected an HTTP request"))
             }
             assertArrayEquals(byteArrayOf(0,0),first);assertFalse(renterEvidenceComplete(m.documents))
             m.clear();assertArrayEquals(byteArrayOf(0,0),second)
@@ -92,17 +111,17 @@ class RenterContractTest {
         login()
         val m=RenterViewModel(repo) { fail("Session expired") }
         try {
-            respond(homeJson);respond("[]")
-            m.open(Gson().fromJson(homeJson,RenterHome::class.java));idle(m);server.takeRequest();server.takeRequest()
+            respond(homeJson);respond("[]");respond("[]")
+            m.open(Gson().fromJson(homeJson,RenterHome::class.java));idle(m);(server.takeRequest(10,java.util.concurrent.TimeUnit.SECONDS) ?: error("Expected an HTTP request"));(server.takeRequest(10,java.util.concurrent.TimeUnit.SECONDS) ?: error("Expected an HTTP request"));(server.takeRequest(10,java.util.concurrent.TimeUnit.SECONDS) ?: error("Expected an HTTP request"))
             respond("{}",403);respond("""{"paymentType":"EXACT_LOCATION_UNLOCK","amountMinor":25000,"currency":"KES"}""")
             m.openAccess("EXACT_LOCATION_UNLOCK");idle(m)
             assertNull(m.location);assertEquals(RenterScreen.UNLOCK_INTRO,m.screen)
-            assertEquals("/api/v1/renter/listings/home/location/exact",server.takeRequest().path)
-            assertEquals("/api/v1/payments/prices/EXACT_LOCATION_UNLOCK",server.takeRequest().path)
+            assertEquals("/api/v1/renter/listings/home/location/exact",(server.takeRequest(10,java.util.concurrent.TimeUnit.SECONDS) ?: error("Expected an HTTP request")).path)
+            assertEquals("/api/v1/payments/prices/EXACT_LOCATION_UNLOCK",(server.takeRequest(10,java.util.concurrent.TimeUnit.SECONDS) ?: error("Expected an HTTP request")).path)
             m.continueToCheckout();assertEquals(RenterScreen.CHECKOUT,m.screen)
-            respond("{}",503);m.createPayment();idle(m);val first=server.takeRequest()
+            respond("{}",503);m.createPayment();idle(m);val first=(server.takeRequest(10,java.util.concurrent.TimeUnit.SECONDS) ?: error("Expected an HTTP request"))
             respond("""{"id":"intent","paymentType":"EXACT_LOCATION_UNLOCK","targetKind":"SUBLESSOR_LISTING","listingId":"home","amountMinor":25000,"currency":"KES","status":"PENDING","providerReference":"synthetic","createdAt":"2026-10-15T10:00:00Z"}""")
-            m.createPayment();idle(m);val retry=server.takeRequest()
+            m.createPayment();idle(m);val retry=(server.takeRequest(10,java.util.concurrent.TimeUnit.SECONDS) ?: error("Expected an HTTP request"))
             assertEquals(first.getHeader("Idempotency-Key"),retry.getHeader("Idempotency-Key"))
             val body=JsonParser.parseString(retry.body.readUtf8()).asJsonObject
             assertFalse(body.has("amountMinor"));assertFalse(body.has("renterId"));assertEquals("home",body["listingId"].asString)
@@ -113,14 +132,14 @@ class RenterContractTest {
         login()
         val m=RenterViewModel(repo) { fail("Session expired") }
         try {
-            respond(homeJson);respond("[]")
-            m.open(Gson().fromJson(homeJson,RenterHome::class.java));idle(m);server.takeRequest();server.takeRequest()
+            respond(homeJson);respond("[]");respond("[]")
+            m.open(Gson().fromJson(homeJson,RenterHome::class.java));idle(m);(server.takeRequest(10,java.util.concurrent.TimeUnit.SECONDS) ?: error("Expected an HTTP request"));(server.takeRequest(10,java.util.concurrent.TimeUnit.SECONDS) ?: error("Expected an HTTP request"));(server.takeRequest(10,java.util.concurrent.TimeUnit.SECONDS) ?: error("Expected an HTTP request"))
             respond("{}",403);respond("{}",503)
             m.openAccess("VIDEO_UNLOCK");idle(m)
             assertNull(m.videos.firstOrNull())
             assertEquals("Unlock pricing is not configured. Use the backend mock profile for test payments, or configure approved prices for live payments.",m.notice)
-            assertEquals("/api/v1/renter/listings/home/media/video",server.takeRequest().path)
-            assertEquals("/api/v1/payments/prices/VIDEO_UNLOCK",server.takeRequest().path)
+            assertEquals("/api/v1/renter/listings/home/media/video",(server.takeRequest(10,java.util.concurrent.TimeUnit.SECONDS) ?: error("Expected an HTTP request")).path)
+            assertEquals("/api/v1/payments/prices/VIDEO_UNLOCK",(server.takeRequest(10,java.util.concurrent.TimeUnit.SECONDS) ?: error("Expected an HTTP request")).path)
         } finally { m.clear() }
     }
     @Test fun missingBookingDepositShowsBookingPricingError()=runBlocking {
@@ -130,14 +149,14 @@ class RenterContractTest {
             m.openApplication(RenterApplication("LANDLORD",OwnerApplication("application","home","APPROVED","2026-10-27","2026-10-27")))
             respond("{}",503);m.book();idle(m)
             assertEquals("Booking deposit pricing is not configured. Use the backend mock profile for the illustrative rent-based deposit, or configure an approved live deposit.",m.notice)
-            assertEquals("/api/v1/renter/bookings/landlord-applications/application",server.takeRequest().path)
+            assertEquals("/api/v1/renter/bookings/landlord-applications/application",(server.takeRequest(10,java.util.concurrent.TimeUnit.SECONDS) ?: error("Expected an HTTP request")).path)
         } finally { m.clear() }
     }
     @Test fun failedMockPaymentUsesTypedProviderOutcomeOnly()=runBlocking {
         login();respond("""{"id":"intent","paymentType":"EXACT_LOCATION_UNLOCK","targetKind":"SUBLESSOR_LISTING","listingId":"home","amountMinor":25000,"currency":"KES","status":"FAILED","providerReference":"synthetic","createdAt":"2026-10-15T10:00:00Z"}""")
         val payment=OwnerPayment("intent","EXACT_LOCATION_UNLOCK","SUBLESSOR_LISTING","home",null,25000,"KES","PENDING","synthetic","2026-10-15T10:00:00Z",null)
         assertEquals("FAILED",repo.complete(payment,MockPaymentResult.FAILED).status)
-        val request=server.takeRequest();assertEquals("/api/v1/payments/mock/completions",request.path)
+        val request=(server.takeRequest(10,java.util.concurrent.TimeUnit.SECONDS) ?: error("Expected an HTTP request"));assertEquals("/api/v1/payments/mock/completions",request.path)
         val body=JsonParser.parseString(request.body.readUtf8()).asJsonObject
         assertEquals("synthetic",body["providerReference"].asString);assertEquals("FAILED",body["outcome"].asString)
         assertFalse(body.has("renterId"));assertFalse(body.has("amountMinor"));assertFalse(body.has("listingId"))
@@ -146,7 +165,7 @@ class RenterContractTest {
         login();respond("""{"id":"intent","paymentType":"VIDEO_UNLOCK","targetKind":"LANDLORD_LISTING","listingId":"home","amountMinor":15000,"currency":"KES","status":"SUCCEEDED","providerReference":"paystack-reference","createdAt":"2026-10-15T10:00:00Z","completedAt":"2026-10-15T10:01:00Z"}""")
         val payment=repo.reconcile("paystack-reference")
         assertEquals("SUCCEEDED",payment.status)
-        val request=server.takeRequest();assertEquals("/api/v1/payments/paystack/reconcile",request.path)
+        val request=(server.takeRequest(10,java.util.concurrent.TimeUnit.SECONDS) ?: error("Expected an HTTP request"));assertEquals("/api/v1/payments/paystack/reconcile",request.path)
         val body=JsonParser.parseString(request.body.readUtf8()).asJsonObject
         assertEquals("paystack-reference",body["reference"].asString)
         assertFalse(body.has("paymentIntentId"));assertFalse(body.has("renterId"))
@@ -154,7 +173,7 @@ class RenterContractTest {
     @Test fun protectedContactClearsOnBackgroundAndMediaHostsAreRestricted()=runBlocking {
         login();val m=RenterViewModel(repo) { fail("Session expired") }
         try {
-            respond(homeJson);respond("[]");m.open(Gson().fromJson(homeJson,RenterHome::class.java));idle(m);server.takeRequest();server.takeRequest()
+            respond(homeJson);respond("[]");respond("[]");m.open(Gson().fromJson(homeJson,RenterHome::class.java));idle(m);(server.takeRequest(10,java.util.concurrent.TimeUnit.SECONDS) ?: error("Expected an HTTP request"));(server.takeRequest(10,java.util.concurrent.TimeUnit.SECONDS) ?: error("Expected an HTTP request"));(server.takeRequest(10,java.util.concurrent.TimeUnit.SECONDS) ?: error("Expected an HTTP request"))
             respond("""{"ownerName":"Synthetic Owner","phoneNumber":"+254700000000"}""")
             m.openAccess("PHONE_UNLOCK");idle(m);assertNotNull(m.phone);assertEquals(RenterScreen.ACCESS,m.screen)
             m.background();assertNull(m.phone);assertNull(m.location);assertTrue(m.videos.isEmpty())

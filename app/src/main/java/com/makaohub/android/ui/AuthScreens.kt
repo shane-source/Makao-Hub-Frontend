@@ -1,6 +1,7 @@
 package com.makaohub.android.ui
 
 import android.content.Context
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
@@ -11,7 +12,9 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
@@ -37,10 +40,29 @@ import java.time.Instant
     model.message?.let { Note(it); Gap(16) }
 }
 
+/** A password needs 8 to 72 characters with a letter and a number, like the website. */
+internal fun passwordHint(p: String): String? = when {
+    p.length < 8 -> "Use at least 8 characters."
+    p.toByteArray(Charsets.UTF_8).size > 72 -> "Use no more than 72 characters."
+    p.none { it.isLetter() } -> "Add at least one letter."
+    p.none { it.isDigit() } -> "Add at least one number."
+    else -> null
+}
+
+/**
+ * A text field that shows its own error text under it. The error appears once the person
+ * has left the field, or straight away when [forceError] is set (after they press the button).
+ */
 @Composable private fun Field(label: String, value: String, onChange: (String) -> Unit,
-    password: Boolean = false, type: KeyboardType = KeyboardType.Text, enabled: Boolean = true) {
+    password: Boolean = false, type: KeyboardType = KeyboardType.Text, enabled: Boolean = true,
+    error: String? = null, forceError: Boolean = false) {
     var visible by remember { mutableStateOf(false) }
+    var focusedOnce by remember { mutableStateOf(false) }
+    var touched by remember { mutableStateOf(false) }
+    val showError = (touched || forceError) && error != null
     OutlinedTextField(value, onChange, label = { Text(label) }, singleLine = true, enabled = enabled,
+        isError = showError,
+        supportingText = if (showError) {{ Text(error.orEmpty()) }} else null,
         visualTransformation = if (password && !visible) PasswordVisualTransformation() else VisualTransformation.None,
         keyboardOptions = KeyboardOptions(keyboardType = if (password) KeyboardType.Password else type),
         trailingIcon = if (password) {{
@@ -49,7 +71,8 @@ import java.time.Instant
                     if (visible) "Hide password" else "Show password")
             }
         }} else null,
-        modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp))
+        modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp)
+            .onFocusChanged { if (it.isFocused) focusedOnce = true else if (focusedOnce) touched = true })
 }
 
 @Composable fun RegisterScreen(model: AuthViewModel, back: () -> Unit) {
@@ -59,30 +82,38 @@ import java.time.Instant
     var consent by rememberSaveable { mutableStateOf(false) }
     var password by remember { mutableStateOf("") }
     var confirm by remember { mutableStateOf("") }
+    var attempted by rememberSaveable { mutableStateOf(false) }
     PageBody(back, !model.busy) {
         Heading("Create your account")
         Gap(16); BodyCopy("Join Makao Hub as a ${model.role.title}.", muted = true); Gap()
         RequestState(model)
-        Field("Full name", name, { name = it }, enabled = !model.busy)
-        Field("Email address", email, { email = it }, type = KeyboardType.Email, enabled = !model.busy)
-        Field("Phone number", phone, { phone = it }, type = KeyboardType.Phone, enabled = !model.busy)
-        Field("Password", password, { password = it }, password = true, enabled = !model.busy)
-        Field("Confirm password", confirm, { confirm = it }, password = true, enabled = !model.busy)
+        Field("Full name", name, { name = it }, enabled = !model.busy,
+            error = if (name.trim().length !in 2..150) "Enter your full name (2–150 characters)." else null, forceError = attempted)
+        Field("Email address", email, { email = it }, type = KeyboardType.Email, enabled = !model.busy,
+            error = if (!validEmail(email)) "Enter a valid email address." else null, forceError = attempted)
+        Field("Phone number", phone, { phone = it }, type = KeyboardType.Phone, enabled = !model.busy,
+            error = if (!validPhone(phone)) "Enter a Kenyan mobile number, such as 0712345678." else null, forceError = attempted)
+        Field("Password", password, { password = it }, password = true, enabled = !model.busy,
+            error = passwordHint(password), forceError = attempted)
+        Field("Confirm password", confirm, { confirm = it }, password = true, enabled = !model.busy,
+            error = if (confirm != password) "Your passwords do not match." else null, forceError = attempted)
         Row(verticalAlignment = Alignment.CenterVertically) {
             Checkbox(consent, { consent = it }, enabled = !model.busy)
             Text("I accept the Terms of Service and Privacy Policy.", modifier = Modifier.weight(1f))
         }
         Gap(12)
-        PrimaryButton("Create account", !model.busy) {
-            model.register(name, email, phone, password, confirm, consent)
+        PrimaryButton("Create account", !model.busy && name.isNotBlank() && email.isNotBlank() && phone.isNotBlank() && password.isNotBlank() && confirm.isNotBlank() && consent) {
+            attempted = true
+            if (registrationError(name, email, phone, password, confirm, consent) == null && passwordHint(password) == null) model.register(name, email, phone, password, confirm, consent)
         }
         Gap(12)
         GoogleButton(model, validate = {
             when {
+                !validPhone(phone) -> "Enter a Kenyan mobile number, such as 0712345678."
                 !consent -> "Accept the Terms of Service and Privacy Policy to continue."
                 else -> null
             }
-        }) { model.googleRegister(it, name, consent) }
+        }) { model.googleRegister(it, name, phone, consent) }
         TextButton({ model.navigate(Page.LOGIN) }, enabled = !model.busy, modifier = Modifier.fillMaxWidth()) {
             Text("Already have an account? Sign in")
         }
@@ -92,21 +123,44 @@ import java.time.Instant
 @Composable fun LoginScreen(model: AuthViewModel, back: () -> Unit) {
     var email by rememberSaveable { mutableStateOf("") }
     var password by remember { mutableStateOf("") }
+    var tried by rememberSaveable { mutableStateOf(false) }
     PageBody(back, !model.busy) {
         Heading("Welcome back")
         Gap(16); BodyCopy("Sign in as ${model.role.title}.", muted = true); Gap()
         RequestState(model)
-        Field("Email address", email, { email = it }, type = KeyboardType.Email, enabled = !model.busy)
-        Field("Password", password, { password = it }, password = true, enabled = !model.busy)
+        Field("Email address", email, { email = it }, type = KeyboardType.Email, enabled = !model.busy,
+            error = if (!validEmail(email)) "Enter a valid email address." else null, forceError = tried)
+        Field("Password", password, { password = it }, password = true, enabled = !model.busy,
+            error = if (password.isBlank()) "Enter your password." else null, forceError = tried)
         TextButton({ model.navigate(Page.FORGOT) }, enabled = !model.busy, modifier = Modifier.align(Alignment.End)) {
             Text("Forgot password?")
         }
-        PrimaryButton("Sign in", !model.busy) { model.login(email, password) }
+        PrimaryButton("Sign in", !model.busy) {
+            tried = true
+            if (validEmail(email) && password.isNotBlank()) model.login(email, password)
+        }
         Gap(12)
         GoogleButton(model, onToken = model::googleLogin)
         TextButton({ model.navigate(Page.ROLE) }, enabled = !model.busy, modifier = Modifier.fillMaxWidth()) {
             Text("Don’t have an account? Sign up")
         }
+    }
+}
+
+@Composable
+fun PhoneCompletionScreen(model: AuthViewModel) {
+    var phone by rememberSaveable { mutableStateOf("") }
+    PageBody(onBack = model::logout, enabled = !model.busy) {
+        Heading("Complete your account")
+        Gap(16)
+        BodyCopy("Add the Kenyan mobile number used for protected contact and payment steps.", muted = true)
+        Gap()
+        RequestState(model)
+        Field("Phone number", phone, { phone = it }, type = KeyboardType.Phone, enabled = !model.busy)
+        Note("Use 07XXXXXXXX, 01XXXXXXXX or +254. Your number is not shown publicly.")
+        Gap(16)
+        PrimaryButton("Save phone number", !model.busy) { model.completePhone(phone) }
+        TextButton(model::logout, enabled = !model.busy, modifier = Modifier.fillMaxWidth()) { Text("Sign out") }
     }
 }
 
@@ -192,6 +246,9 @@ import java.time.Instant
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     var requesting by remember { mutableStateOf(false) }
+    // The official Google "G" from Google's branding page, saved as res/drawable/ic_google_logo (.xml or .png).
+    // Looked up by name so the app still builds, just without the icon, until that file is added.
+    val logoRes = remember { context.resources.getIdentifier("ic_google_logo", "drawable", context.packageName) }
     OutlinedButton(onClick = {
         val problem = validate()
         if (problem != null) { model.showMessage(problem); return@OutlinedButton }
@@ -208,7 +265,13 @@ import java.time.Instant
             finally { requesting = false }
         }
     }, enabled = !model.busy && !requesting, modifier = Modifier.fillMaxWidth().heightIn(min = 50.dp)) {
-        Text(if (requesting) "Connecting to Google…" else "Continue with Google")
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.Center) {
+            if (logoRes != 0) {
+                Image(painter = painterResource(logoRes), contentDescription = null, modifier = Modifier.size(20.dp))
+                Spacer(Modifier.width(12.dp))
+            }
+            Text(if (requesting) "Connecting to Google…" else "Continue with Google")
+        }
     }
 }
 

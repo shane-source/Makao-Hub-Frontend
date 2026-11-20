@@ -21,17 +21,30 @@ android {
     require(mockPayments == "true" || mockPayments == "false")
     buildTypes {
         getByName("debug") { buildConfigField("boolean", "MOCK_PAYMENTS_ENABLED", mockPayments) }
-        getByName("release") { buildConfigField("boolean", "MOCK_PAYMENTS_ENABLED", "false") }
+        getByName("release") {
+            buildConfigField("boolean", "MOCK_PAYMENTS_ENABLED", "false")
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+        }
+        create("minified") {
+            initWith(getByName("release"))
+            signingConfig = signingConfigs.getByName("debug")
+        }
     }
 
     val apiUrl = providers.gradleProperty("MAKAO_API_BASE_URL").orElse("http://10.0.2.2:8080/").get()
     val googleClientId = providers.gradleProperty("MAKAO_GOOGLE_WEB_CLIENT_ID").orElse("").get()
+    val mapsApiKey = providers.gradleProperty("MAKAO_GOOGLE_MAPS_API_KEY").orElse("").get()
     require(apiUrl.endsWith("/") && (apiUrl.startsWith("https://") || apiUrl.startsWith("http://")))
     require(!apiUrl.contains('"') && !apiUrl.contains('\\') && !apiUrl.contains('\n'))
     require(googleClientId.matches(Regex("[A-Za-z0-9._-]*")))
+    require(!mapsApiKey.contains('"') && !mapsApiKey.contains('\\') && !mapsApiKey.contains('\n'))
     defaultConfig {
         buildConfigField("String", "API_BASE_URL", "\"$apiUrl\"")
         buildConfigField("String", "GOOGLE_WEB_CLIENT_ID", "\"$googleClientId\"")
+        buildConfigField("String", "GOOGLE_MAPS_API_KEY", "\"$mapsApiKey\"")
+        manifestPlaceholders["googleMapsApiKey"] = mapsApiKey
     }
 
 
@@ -52,6 +65,7 @@ dependencies {
     implementation("androidx.core:core-ktx:1.19.0")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.11.0")
     implementation("org.maplibre.gl:android-sdk-opengl:13.6.1")
+    implementation("com.google.android.gms:play-services-maps:20.1.0")
     implementation("androidx.camera:camera-camera2:1.5.3")
     implementation("androidx.camera:camera-lifecycle:1.5.3")
     implementation("androidx.camera:camera-view:1.5.3")

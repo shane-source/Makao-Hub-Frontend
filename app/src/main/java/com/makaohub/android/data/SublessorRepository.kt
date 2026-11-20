@@ -14,7 +14,8 @@ class SharedListingRequest(val title: String, val description: String, val space
     val monthlyRentKes: Long, val bathroomCount: Int, val furnished: Boolean, val availableFrom: String?)
 data class SharedInterest(val id: String, val sublessorListingId: String, val status: String, val createdAt: String, val updatedAt: String)
 data class SharedThread(val id: String, val roommateInterestId: String, val status: String, val chatUnlocked: Boolean,
-    val createdAt: String, val updatedAt: String, val closedAt: String?)
+    val createdAt: String, val updatedAt: String, val closedAt: String?, val counterpartyName:String?=null,
+    val counterpartyAvatarUrl:String?=null, val lastMessage:String?=null, val lastMessageAt:String?=null)
 data class SharedThreadPage(val content: List<SharedThread>, val number: Int, val totalPages: Int, val last: Boolean)
 data class SharedMessagePage(val items: List<OwnerMessage>, val nextCursor: String?, val hasMore: Boolean)
 class SharedHousehold(val depositKes: Long?, val currentHousehold: String?, val totalOccupants: Int?, val peoplePerRoom: Int?, val lifestyle: String?, val amenities: Set<String>)
@@ -36,6 +37,33 @@ internal fun sharedVerificationReady(documents: List<OwnerVerificationDocument>)
 
 /** All identities come from the shared authenticated session, never a Sublessor ID supplied by a form. */
 class SublessorRepository(private val auth: AuthRepository) {
+    suspend fun amenities() = auth.authorized("SUBLESSOR") { a,h -> a.amenities(h) }
+    suspend fun selectedAmenities(id:String) = auth.authorized("SUBLESSOR") { a,h -> a.listingAmenities(h,"sublessor",id) }
+    suspend fun saveAmenities(id:String,ids:Set<String>) = auth.authorized("SUBLESSOR") { a,h -> a.saveListingAmenities(h,"sublessor",id,AmenitySelection(ids)) }
+
+    suspend fun notes() = auth.authorized("SUBLESSOR") { api,h -> api.applicationNotes(h,"sublessor") }
+    suspend fun hide(id:String, hidden:Boolean) = auth.authorized("SUBLESSOR") { api,h -> api.hideApplication(h,"sublessor",id,ApplicationHidden(hidden)).requireSuccess() }
+    suspend fun remark(id:String, value:String) = auth.authorized("SUBLESSOR") { api,h -> api.remarkApplication(h,"sublessor",id,ApplicationRemark(value)).requireSuccess() }
+    suspend fun conversation(id:String) = auth.authorized("SUBLESSOR") { api,h -> api.sublessorApplicationConversation(h,id) }
+    suspend fun cardMetrics() = auth.authorized("SUBLESSOR") { api, h -> api.sublessorCardMetrics(h) }
+    suspend fun offers() = auth.authorized("SUBLESSOR") { api, h -> api.sublessorOffers(h) }
+    suspend fun offerCheckout(code: String, listingId: String, key: String) = auth.authorized("SUBLESSOR") { api, h ->
+        api.sublessorOfferCheckout(h, key, LandlordOfferPurchase(code, listingId))
+    }
+    suspend fun bookings() = auth.authorized("SUBLESSOR") { api, h -> api.ownerBookings(h, "sublessor") }
+    suspend fun confirmBookingTerms(id: String) = auth.authorized("SUBLESSOR") { api, h -> api.ownerConfirmTerms(h, "sublessor", id) }
+    suspend fun confirmBookingMoveIn(id: String, key: String) = auth.authorized("SUBLESSOR") { api, h -> api.ownerConfirmMoveIn(h, "sublessor", id, key) }
+    suspend fun planCheckout(code: String, key: String) = auth.authorized("SUBLESSOR") { api, h ->
+        api.sublessorOfferCheckout(h, key, LandlordOfferPurchase(code, null))
+    }
+    suspend fun redeemIncludedBoost(listingId: String) = auth.authorized("SUBLESSOR") { api, h ->
+        api.sublessorRedeemBoost(h, BoostRedeemBody(listingId))
+    }
+    suspend fun reconcileOffer(reference: String) = auth.authorized("SUBLESSOR") { api, h -> api.reconcilePaystack(h, PaystackReconcileBody(reference)) }
+    suspend fun testDestination() = auth.authorized("SUBLESSOR") { api, h -> api.sublessorTestDestination(h) }
+    suspend fun configureTestDestination(phone: String, key: String) = auth.authorized("SUBLESSOR") { api, h ->
+        api.sublessorConfigureTestDestination(h, key, OwnerTestDestinationRequest(phone))
+    }
     suspend fun verification() = auth.authorized("SUBLESSOR") { api, h -> api.sublessorVerification(h) }
     suspend fun documents() = auth.authorized("SUBLESSOR") { api, h -> api.sublessorDocuments(h) }
     suspend fun ticket(type: SharedEvidence, replace: Boolean = false) = auth.authorized("SUBLESSOR") { api, h ->
@@ -67,6 +95,7 @@ class SublessorRepository(private val auth: AuthRepository) {
     suspend fun discovery(page: Int = 0) = auth.authorized("SUBLESSOR") { api, h -> api.sharedDiscovery(h, page) }
     suspend fun renterProfile(id: String) = auth.authorized("SUBLESSOR") { api, h -> api.sharedRenterProfile(h, id) }
     suspend fun media(id: String) = auth.authorized("SUBLESSOR") { api, h -> api.sharedMedia(h, id) }
+    suspend fun cover(id: String) = auth.authorized("SUBLESSOR") { api, h -> api.sharedPhotos(h, id).firstOrNull() }
     suspend fun mediaTicket(id: String, body: MediaUploadRequest) = auth.authorized("SUBLESSOR") { api, h -> api.sharedMediaTicket(h, id, body) }
     suspend fun confirmMedia(id: String, media: String) = auth.authorized("SUBLESSOR") { api, h -> api.confirmSharedMedia(h, id, media) }
     suspend fun deleteMedia(id: String, media: String) = auth.authorized("SUBLESSOR") { api, h -> api.deleteSharedMedia(h, id, media).requireSuccess() }
@@ -78,10 +107,12 @@ class SublessorRepository(private val auth: AuthRepository) {
     suspend fun interests() = auth.authorized("SUBLESSOR") { api, h -> api.roommateInterests(h) }
     suspend fun interestAction(id: String, action: String) = auth.authorized("SUBLESSOR") { api, h ->
         require(action in listOf("review", "accept", "decline")); api.roommateInterestAction(h, id, action) }
+    suspend fun chatStates() = auth.authorized("SUBLESSOR") { api, h -> api.chatStates(h, "sublessor") }
+    suspend fun setChatState(kind: String, id: String, state: String) = auth.authorized("SUBLESSOR") { api, h -> api.setChatState(h, "sublessor", kind, id, ChatStateBody(state)).requireSuccess() }
     suspend fun threads(page: Int) = auth.authorized("SUBLESSOR") { api, h -> api.roommateThreads(h, page) }
     suspend fun messages(id: String, cursor: String? = null) = auth.authorized("SUBLESSOR") { api, h -> api.roommateMessages(h, id, cursor) }
     suspend fun payments(page: Int) = auth.authorized("SUBLESSOR") { api, h -> api.ownerPayments(h, page) }
-    suspend fun connect(events: (ChatEvent) -> Unit): RentalChatSocket = auth.authorized("SUBLESSOR") { _, h ->
+    suspend fun connect(events: (ChatEvent) -> Unit): RentalChatSocket = auth.authorizedForSocket("SUBLESSOR") { h ->
         RentalChatSocket(com.makaohub.android.BuildConfig.API_BASE_URL, h, ChatChannel.ROOMMATE, events).also { it.connect() } }
 
     private val transferClient = OkHttpClient.Builder().retryOnConnectionFailure(false).followRedirects(false)

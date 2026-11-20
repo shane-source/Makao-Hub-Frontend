@@ -20,6 +20,7 @@ class RentalChatSocket(private val baseUrl: String, private val authorization: S
     private val subscription = if (channel == ChatChannel.RENTAL) "rental-messages" else "roommate-messages"
     private val destination = if (channel == ChatChannel.RENTAL) "/user/queue/rental-chat.messages" else "/user/queue/chat.messages"
     private val sendDestination = if (channel == ChatChannel.RENTAL) "/app/rental-chat.send" else "/app/chat.send"
+    private val deliveryDestination = if (channel == ChatChannel.RENTAL) "/app/rental-chat.delivered" else "/app/chat.delivered"
     private var socket: WebSocket? = null
     private val parser = StompFrames()
     private val gson = Gson()
@@ -70,12 +71,19 @@ class RentalChatSocket(private val baseUrl: String, private val authorization: S
         if (frame.toByteArray(Charsets.UTF_8).size > 8192) return false
         return socket?.send(frame) == true
     }
+    /** Acknowledge only messages received from the other participant. */
+    fun acknowledge(threadId: String, messageIds: List<String>): Boolean {
+        if (!ready || threadId.isBlank() || messageIds.isEmpty() || messageIds.size > 100) return false
+        val body = gson.toJson(mapOf("threadId" to threadId, "messageIds" to messageIds))
+        val frame = "SEND\ndestination:$deliveryDestination\ncontent-type:application/json\ncontent-length:${body.toByteArray(Charsets.UTF_8).size}\n\n$body\u0000"
+        return frame.toByteArray(Charsets.UTF_8).size <= 8192 && socket?.send(frame) == true
+    }
     override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) = unavailable()
     override fun onClosing(webSocket: WebSocket, code: Int, reason: String) { webSocket.close(1000, null); unavailable() }
     override fun onClosed(webSocket: WebSocket, code: Int, reason: String) = unavailable()
     private fun unavailable() {
         ready = false
-        if (!stopped) events(ChatEvent.Unavailable("Chat disconnected. Reconnect to continue; your saved history is still available."))
+        if (!stopped) events(ChatEvent.Unavailable("Connection lost."))
     }
     fun close() { stopped = true; ready = false; socket?.close(1000, null); socket = null }
 

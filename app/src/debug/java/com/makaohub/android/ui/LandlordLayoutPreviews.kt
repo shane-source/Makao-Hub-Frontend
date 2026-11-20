@@ -21,9 +21,9 @@ private fun LandlordDashboardPreview() {
     val draft = OwnerListing("preview-listing", "Garden Studio", "Preview only", "STUDIO",
         18000L, 1, 1, false, null, "DRAFT", "2026-10-21T06:00:00Z", "2026-10-21T06:00:00Z")
     MakaoTheme {
-        Scaffold(containerColor = Cream, bottomBar = {
+        Scaffold(containerColor = DashboardBackground, bottomBar = {
             Box(Modifier.navigationBarsPadding().padding(horizontal = 24.dp, vertical = 16.dp)) {
-                OwnerBottomBar(OwnerScreen.HOME, true) {}
+                OwnerBottomBar(OwnerScreen.HOME, true, select = {})
             }
         }) { insets ->
             Column(Modifier.fillMaxSize().padding(insets).verticalScroll(rememberScrollState()).padding(horizontal = 24.dp)) {

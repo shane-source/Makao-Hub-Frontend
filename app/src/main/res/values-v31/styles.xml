@@ -1,0 +1,13 @@
+<resources>
+    <style name="Theme.MakaoHub" parent="android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/black</item>
+        <item name="android:windowActionModeOverlay">true</item>
+        <item name="android:windowBackground">@drawable/launch_background</item>
+        <!-- Android 12+ draws its own launch screen; keep it empty and matched to the top of the splash artwork instead of the logo. -->
+        <item name="android:windowSplashScreenBackground">@color/makao_launch_background</item>
+        <item name="android:windowSplashScreenAnimatedIcon">@drawable/launch_blank</item>
+    </style>
+</resources>

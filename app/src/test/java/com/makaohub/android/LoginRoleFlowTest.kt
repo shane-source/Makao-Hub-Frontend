@@ -60,6 +60,25 @@ class LoginRoleFlowTest {
         assertEquals(3, server.requestCount)
     }
 
+    @Test fun activityKeepsSessionUntilOneMinuteWithoutInteraction() = runBlocking {
+        challenge(); model.login("synthetic@example.invalid", "synthetic-password"); idle()
+        respond("""{"accessToken":"synthetic-access","refreshToken":"synthetic-refresh","role":"RENTER","userId":"synthetic"}""")
+        respond("""{"id":"synthetic","fullName":"Synthetic","email":"synthetic@example.invalid","role":"RENTER","accountStatus":"ACTIVE"}""")
+        model.verify("123456"); idle()
+        assertEquals(Page.ACCOUNT, model.page)
+        model.noteUserActivity(100_000, 10_000)
+        model.checkInactivity(159_999, 69_999)
+        assertEquals(Page.ACCOUNT, model.page)
+        model.noteUserActivity(159_999, 69_999)
+        model.checkInactivity(219_998, 129_998)
+        assertEquals(Page.ACCOUNT, model.page)
+        server.enqueue(MockResponse().setResponseCode(204))
+        model.checkInactivity(219_999, 129_999)
+        assertEquals(Page.LOGIN, model.page)
+        assertNull(model.profile)
+        assertTrue(model.message!!.contains("inactivity"))
+    }
+
     @Test fun oldServerWrongRoleTokensReturnToSignInWithoutProfileRequest() = runBlocking {
         model.selectRole(SignupRole.RENTER)
         challenge(); model.googleLogin("synthetic-token"); idle()

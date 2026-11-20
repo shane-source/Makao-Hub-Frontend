@@ -70,6 +70,15 @@ class LandlordContractTest {
         assertEquals("Bearer test-access", deleteDraft.getHeader("Authorization"))
     }
 
+    @Test fun removingAListingArchivesItThroughTheOwnedRoute() = runBlocking {
+        session(); respond(listing.replace("DRAFT", "ARCHIVED"))
+        assertEquals("ARCHIVED", owner.transition("listing-1", "archive").status)
+        val request = server.takeRequest()
+        assertEquals("POST", request.method)
+        assertEquals("/api/v1/landlord/listings/listing-1/archive", request.path)
+        assertEquals("Bearer test-access", request.getHeader("Authorization"))
+    }
+
     @Test fun renterCannotCallLandlordApiAndFailedAccessDoesNotInventListings() = runBlocking {
         session("RENTER")
         try { owner.listings(); fail("Wrong active role must be rejected") } catch (_: WorkspaceUnavailable) { }

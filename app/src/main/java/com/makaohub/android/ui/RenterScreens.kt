@@ -1,3 +1,5 @@
+@file:OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
+
 package com.makaohub.android.ui
 
 import android.app.Activity
@@ -12,11 +14,17 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
@@ -28,9 +36,12 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -50,14 +61,55 @@ import org.maplibre.android.geometry.LatLng
 import java.math.BigDecimal
 import java.util.concurrent.TimeUnit
 
+@Composable fun OfflineRenterDashboard(auth: AuthViewModel) {
+    val homes = remember { auth.offlineHomes?.read().orEmpty() }
+    var search by rememberSaveable { mutableStateOf("") }
+    val visibleHomes = homes.filter { search.isBlank() || it.title.contains(search, true) || it.area.contains(search, true) }
+    Column(Modifier.fillMaxSize().background(DashboardBackground).statusBarsPadding().navigationBarsPadding()
+        .verticalScroll(rememberScrollState()).padding(22.dp)) {
+        Text("makao hub", color = Brown, fontWeight = FontWeight.Bold)
+        Gap(24)
+        RenterHeading("Find your next chapter", "Browse homes you loaded earlier.")
+        SharedNote("Makao Hub is offline. These homes may have changed or may no longer be available. Reconnect to use account features; sign in again if your session has expired.")
+        auth.message?.let { SharedText(it, true) }
+        Gap(12)
+        SharedButton(if (auth.busy) "Checking connection…" else "Try again", !auth.busy, auth::retryOffline)
+        if (!auth.offlineSession) SharedLink("Sign in", !auth.busy) { auth.navigate(Page.LOGIN) }
+        Gap(12)
+        OutlinedTextField(value = search, onValueChange = { search = it.take(150) }, modifier = Modifier.fillMaxWidth(),
+            singleLine = true, placeholder = { Text("Search saved homes or areas") },
+            leadingIcon = { Icon(Icons.Outlined.Search, contentDescription = null) }, shape = RoundedCornerShape(28.dp))
+        Gap(16)
+        if (homes.isEmpty()) SharedCard { SharedText("No previously loaded homes are available on this device.") }
+        else if (visibleHomes.isEmpty()) SharedCard { SharedText("No saved homes match your search.") }
+        visibleHomes.forEach { home ->
+            SharedCard {
+                // A photo is shown only when it is already stored on this device.
+                val offlineContext = LocalContext.current.applicationContext
+                home.cover?.takeIf { PhotoCache.cached(offlineContext, it) }?.let { cover ->
+                    Box(Modifier.fillMaxWidth().height(180.dp).clip(RoundedCornerShape(14.dp)).background(Sand)) {
+                        RemoteHomePhoto(cover, Modifier.fillMaxSize())
+                    }
+                    Gap(8)
+                }
+                SharedText(home.title)
+                SharedText(home.area, true)
+                SharedText(kes(home.rent) + " / month")
+                SharedText((home.bedrooms?.let { "$it beds · " } ?: "") + "${home.bathrooms} baths", true)
+            }
+            Gap(12)
+        }
+    }
+}
+
 @Composable fun RenterWorkspace(auth:AuthViewModel,profile:MyProfile) {
     val model:RenterViewModel=viewModel(key="renter-"+profile.id,factory=object:ViewModelProvider.Factory {
         @Suppress("UNCHECKED_CAST") override fun <T:ViewModel> create(modelClass:Class<T>):T =
-            RenterViewModel(RenterRepository(auth.repository)) { auth.navigate(Page.LOGIN) } as T
+            RenterViewModel(RenterRepository(auth.repository, auth.offlineHomes), auth.offlineHomes) { auth.navigate(Page.LOGIN) } as T
     })
     val context=LocalContext.current
     val window=remember(context) { generateSequence(context) { (it as? ContextWrapper)?.baseContext }.filterIsInstance<Activity>().firstOrNull()?.window }
-    val sensitive=model.screen in listOf(RenterScreen.VERIFICATION,RenterScreen.ACCESS)
+    val sensitive=BLOCK_SCREEN_CAPTURE && model.screen in listOf(RenterScreen.VERIFICATION,RenterScreen.ACCESS)
     DisposableEffect(window,sensitive) { if(sensitive) window?.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
         onDispose { if(sensitive) window?.clearFlags(WindowManager.LayoutParams.FLAG_SECURE) } }
     val owner=LocalLifecycleOwner.current
@@ -67,6 +119,7 @@ import java.util.concurrent.TimeUnit
         onDispose { owner.lifecycle.removeObserver(listener); model.clear() }
     }
     LaunchedEffect(model) { model.start() }
+    LaunchedEffect(model.offline) { if (model.offline) { model.consumeOffline(); auth.enterOffline() } }
     val back={ model.go(when(model.screen) {
         RenterScreen.DETAIL,RenterScreen.FILTERS,RenterScreen.AREA -> RenterScreen.RESULTS
         RenterScreen.REPORT -> RenterScreen.DETAIL
@@ -80,21 +133,42 @@ import java.util.concurrent.TimeUnit
     if(model.screen==RenterScreen.VERIFICATION) { RenterVerification(model); return }
     val snackbar=remember { SnackbarHostState() }
     LaunchedEffect(model.notice) { model.notice?.let { snackbar.showSnackbar(it); model.dismissNotice() } }
-    Scaffold(containerColor=Cream,snackbarHost={SnackbarHost(snackbar)},bottomBar={
-        if(model.screen!=RenterScreen.VERIFICATION) NavigationBar(containerColor=androidx.compose.ui.graphics.Color.White) {
-            listOf(Triple(RenterScreen.HOME,"Home",Icons.Outlined.Home),Triple(RenterScreen.RESULTS,"Search",Icons.Outlined.Search),
+    Scaffold(containerColor=if(model.screen in listOf(RenterScreen.HOME,RenterScreen.RESULTS,RenterScreen.SAVED,RenterScreen.PROFILE,RenterScreen.INBOX)) DashboardBackground else Cream,snackbarHost={SnackbarHost(snackbar)},bottomBar={
+        if(model.screen!=RenterScreen.VERIFICATION) Box(Modifier.navigationBarsPadding().padding(horizontal=24.dp).padding(bottom=16.dp,top=8.dp)) {
+        Surface(color=androidx.compose.ui.graphics.Color.White,shape=RoundedCornerShape(18.dp)) { FixedFontScale { NavigationBar(containerColor=androidx.compose.ui.graphics.Color.White,tonalElevation=0.dp) {
+            listOf(Triple(RenterScreen.HOME,"Home",Icons.Outlined.Home),Triple(RenterScreen.SAVED,"Saved",Icons.Outlined.FavoriteBorder),
                 Triple(RenterScreen.APPLICATIONS,"Applications",Icons.Outlined.Description),Triple(RenterScreen.INBOX,"Messages",Icons.Outlined.ChatBubbleOutline),
                 Triple(RenterScreen.PROFILE,"Profile",Icons.Outlined.PersonOutline)).forEach { (page,label,icon)->
-                NavigationBarItem(selected=model.screen==page,onClick={model.go(page)},enabled=!model.busy,icon={Icon(icon,null,Modifier.size(21.dp))},label={Text(label,fontSize=10.sp)})
+                val selected=when(page) {
+                    RenterScreen.HOME -> model.screen in listOf(RenterScreen.HOME,RenterScreen.RESULTS,RenterScreen.AREA,RenterScreen.FILTERS,RenterScreen.DETAIL)
+                    RenterScreen.APPLICATIONS -> model.screen in listOf(RenterScreen.APPLICATIONS,RenterScreen.APPLICATION,RenterScreen.BOOKING)
+                    RenterScreen.INBOX -> model.screen in listOf(RenterScreen.INBOX,RenterScreen.CHAT)
+                    RenterScreen.PROFILE -> model.screen in listOf(RenterScreen.PROFILE,RenterScreen.HISTORY)
+                    else -> model.screen==page
+                }
+                NavigationBarItem(selected=selected,onClick={model.go(page)},enabled=!model.busy,
+                    colors=NavigationBarItemDefaults.colors(indicatorColor=androidx.compose.ui.graphics.Color.Transparent,selectedIconColor=Brown,selectedTextColor=Brown,unselectedIconColor=Muted,unselectedTextColor=Muted),
+                    icon={BadgedTabIcon(icon,when(page) { RenterScreen.APPLICATIONS->ApplicationSeen.unseen(androidx.compose.ui.platform.LocalContext.current,model.applications.map { "${it.value.id}:${it.value.status}" })
+                        RenterScreen.INBOX->ChatSeen.unread(androidx.compose.ui.platform.LocalContext.current,model.inboxThreads.map { it.id to it.lastMessageAt })
+                        else->0 },LocalContentColor.current)},label={NavLabel(label)})
             }
-        }
+        } } } }
     }) { insets->
         val scroll=rememberScrollState()
         LaunchedEffect(model.screen) { scroll.scrollTo(0) }
+        LaunchedEffect(model) { while(true) { model.refreshBadges(); delay(8_000) } }
+        val seenContext=androidx.compose.ui.platform.LocalContext.current
+        LaunchedEffect(model.screen,model.applications) {
+            if (model.screen in listOf(RenterScreen.APPLICATIONS,RenterScreen.APPLICATION,RenterScreen.BOOKING))
+                ApplicationSeen.markSeen(seenContext,model.applications.map { "${it.value.id}:${it.value.status}" })
+        }
         Column(Modifier.fillMaxSize().padding(insets).statusBarsPadding().imePadding().verticalScroll(scroll).padding(horizontal=22.dp).padding(bottom=24.dp)) {
-            Row(Modifier.height(52.dp),verticalAlignment=Alignment.CenterVertically) {
+            Row(Modifier.fillMaxWidth().height(52.dp),verticalAlignment=Alignment.CenterVertically) {
                 IconButton(back,enabled=!model.busy,modifier=Modifier.size(28.dp)) { Icon(Icons.AutoMirrored.Outlined.ArrowBack,"Back",tint=Brown,modifier=Modifier.size(18.dp)) }
                 Spacer(Modifier.width(6.dp)); Text("makao hub",color=Brown,fontSize=15.sp,fontWeight=FontWeight.Bold)
+                Spacer(Modifier.weight(1f))
+                IconButton({ model.go(RenterScreen.HISTORY) }, enabled = !model.busy, modifier = Modifier.size(34.dp)) { Icon(Icons.Outlined.Payments, "Payments", tint = Brown, modifier = Modifier.size(21.dp)) }
+                Spacer(Modifier.width(56.dp))
             }
             if(model.busy) { LinearProgressIndicator(Modifier.fillMaxWidth()); Gap(12) }
             when(model.screen) {
@@ -104,21 +178,73 @@ import java.util.concurrent.TimeUnit
                 RenterScreen.REPORT -> RenterReport(model)
                 RenterScreen.VERIFICATION -> RenterVerification(model)
                 RenterScreen.APPLY -> {
-                    RenterHeading("Ready to apply?",model.selected?.title?:"")
+                    RenterHeading("Ready to book?",model.selected?.title?:"")
                     SharedCard { SharedText("Your application"); SharedText(profile.fullName)
                         model.selected?.let { SharedText(kes(it.monthlyRentKes)+" / month") } }
                     var consent by rememberSaveable { mutableStateOf(false) }
+                    var moveIn by rememberSaveable { mutableStateOf<String?>(null) }
+                    var note by rememberSaveable { mutableStateOf("") }
+                    var picking by remember { mutableStateOf(false) }
+                    val today=remember { java.time.LocalDate.now(java.time.ZoneId.of("Africa/Nairobi")) }
+                    val chosen=moveIn?.let { runCatching { java.time.LocalDate.parse(it) }.getOrNull() }
+                    val dateOk=chosen!=null && !chosen.isBefore(today) && !chosen.isAfter(today.plusYears(1))
+                    SharedCard {
+                        Text("When do you want to move in?",color=Brown,fontSize=18.sp)
+                        OutlinedButton({ picking=true },enabled=!model.busy,modifier=Modifier.fillMaxWidth()) {
+                            Text(moveInLabel(moveIn)?:"Choose move-in date",color=Brown)
+                        }
+                        if(chosen!=null && !dateOk) SharedText("Choose a date from today up to one year ahead.",true)
+                    }
+                    if(picking) {
+                        val pickerState=rememberDatePickerState()
+                        DatePickerDialog(onDismissRequest={picking=false},
+                            confirmButton={ TextButton({
+                                pickerState.selectedDateMillis?.let { moveIn=java.time.Instant.ofEpochMilli(it).atZone(java.time.ZoneOffset.UTC).toLocalDate().toString() }
+                                picking=false
+                            }) { Text("Select") } },
+                            dismissButton={ TextButton({ picking=false }) { Text("Cancel") } }) { DatePicker(pickerState) }
+                    }
+                    OutlinedTextField(note,{ note=it.take(500) },label={ Text("Message to the host (optional)") },minLines=3,maxLines=5,
+                        enabled=!model.busy,modifier=Modifier.fillMaxWidth())
                     Row(verticalAlignment=Alignment.CenterVertically) { Checkbox(consent,{consent=it},enabled=!model.busy); SharedText("I consent to submit this application") }
-                    SharedNote("Submitting an application does not reserve the home or move money.")
-                    SharedButton("Submit application",!model.busy && consent,model::apply)
+                    SharedButton("Submit booking request",!model.busy && consent && dateOk) { model.apply(moveIn.orEmpty(),note) }
                 }
                 RenterScreen.APPLICATIONS -> {
                     RenterHeading("Your applications","Keep track of every next step.")
-                    model.applications.forEach { a->SharedCard {
-                        SharedText(a.source.lowercase().replaceFirstChar { it.uppercase() }+" home"); RenterStatus(a.value.status)
-                        SharedLink("View application",!model.busy) { model.openApplication(a) }
-                    } }
-                    if(model.applications.isEmpty()) SharedText("No applications yet.",true)
+                    var menuFor by remember { mutableStateOf<RenterApplication?>(null) }
+                    var confirmDelete by remember { mutableStateOf<RenterApplication?>(null) }
+                    ArchiveTabs(model.archivedApplications.size,model.showArchivedApps) { model.showArchivedApps=it }
+                    val shown=if(model.showArchivedApps) model.archivedApplications else model.visibleApplications
+                    AppSummaryRow(shown.map { it.value.status })
+                    shown.forEach { a->Box(Modifier.pointerInput(a.value.id) { detectTapGestures(onLongPress={ if(!model.busy) menuFor=a }) }) { AppAccentCard(a.value.status) {
+                        var cover by remember(a.value.id) { mutableStateOf<String?>(null) }
+                        LaunchedEffect(a.value.id) { cover=try { model.applicationCover(a) } catch(e:CancellationException) { throw e } catch(_:Exception) { null } }
+                        Row(Modifier.fillMaxWidth(),verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(14.dp)) {
+                            val thumb=Modifier.size(84.dp).clip(RoundedCornerShape(16.dp))
+                            cover?.let { RemoteHomePhoto(it,thumb) } ?: Box(thumb.background(Sand),contentAlignment=Alignment.Center) { Icon(Icons.Outlined.Home,null,tint=Brown,modifier=Modifier.size(32.dp)) }
+                            Column(Modifier.weight(1f),verticalArrangement=Arrangement.spacedBy(6.dp)) {
+                                Text(a.source.lowercase().replaceFirstChar { it.uppercase() }+" home",color=Ink,fontSize=18.sp,fontWeight=FontWeight.Bold)
+                                AppStatusBadge(a.value.status)
+                                Text(appStatusLook(a.value.status).hint,color=Muted,fontSize=12.sp)
+                            }
+                        }
+                        Button(onClick={ model.openApplication(a) },enabled=!model.busy,modifier=Modifier.fillMaxWidth().heightIn(min=46.dp),shape=RoundedCornerShape(14.dp),colors=ButtonDefaults.buttonColors(containerColor=Brown)) {
+                            Text("View application",color=Color.White,fontWeight=FontWeight.SemiBold)
+                        }
+                        Text("Press and hold the card for more options",color=Muted,fontSize=11.sp)
+                    } } }
+                    if(shown.isEmpty()) SharedText(if(model.showArchivedApps) "No archived applications." else "No applications yet.",true)
+                    menuFor?.let { a-> AlertDialog(onDismissRequest={ menuFor=null },title={ Text("Application options") },
+                        text={ Column {
+                            if(model.showArchivedApps) TextButton(onClick={ menuFor=null; model.restoreApplication(a) },enabled=!model.busy) { Text("Move back to my list") }
+                            else TextButton(onClick={ menuFor=null; model.archiveApplication(a) },enabled=!model.busy) { Text("Archive application") }
+                            TextButton(onClick={ menuFor=null; confirmDelete=a },enabled=!model.busy) { Text("Delete application",color=Color(0xFFAB4B3F)) }
+                        } },
+                        confirmButton={ TextButton(onClick={ menuFor=null }) { Text("Close") } }) }
+                    confirmDelete?.let { a-> AlertDialog(onDismissRequest={ confirmDelete=null },title={ Text("Delete application?") },
+                        text={ Text("It disappears from your list. The host keeps their record, and a booking in progress can’t be deleted.") },
+                        confirmButton={ TextButton(onClick={ confirmDelete=null; model.deleteApplication(a) },enabled=!model.busy) { Text("Delete application",color=Color(0xFFAB4B3F)) } },
+                        dismissButton={ TextButton(onClick={ confirmDelete=null }) { Text("Cancel") } }) }
                 }
                 RenterScreen.APPLICATION -> RenterApplicationDetail(model)
                 RenterScreen.BOOKING -> RenterBookingDetail(model)
@@ -126,40 +252,42 @@ import java.util.concurrent.TimeUnit
                 RenterScreen.CHECKOUT,RenterScreen.PAYMENT -> RenterCheckout(model)
                 RenterScreen.ACCESS -> RenterAccess(model)
                 RenterScreen.HISTORY -> {
-                    RenterHeading("Payment history",if(BuildConfig.MOCK_PAYMENTS_ENABLED) "Your test transactions" else "Your Paystack transactions")
-                    MockNotice()
+                    RenterHeading("Payment history","Your payments")
                     model.history?.items?.forEach { p->SharedCard { SharedText(paymentTitle(p.paymentType)); RenterStatus(paymentStatus(p)); SharedText(minor(p.amountMinor))
                         SharedLink("View",!model.busy) { model.openPayment(p) } } }
                     if(model.history?.hasNext==true) SharedLink("Load more",!model.busy,model::nextHistory)
                 }
                 RenterScreen.INBOX -> {
                     var query by rememberSaveable { mutableStateOf("") }
-                    ProtectedInboxHeader("Your protected messages",query) { query=it }
-                    val visible=model.threads.filter { t->
-                        query.isBlank() || listOf(t.source,t.id).any { it.contains(query.trim(),ignoreCase=true) }
+                    ProtectedInboxHeader(query) { query=it }
+                    ArchiveTabs(model.archivedThreads.size,model.showArchived) { model.showArchived=it }
+                    val visible=(if(model.showArchived) model.archivedThreads else model.inboxThreads).filter { t->
+                        query.isBlank() || listOfNotNull(t.name,t.lastMessage).any { it.contains(query.trim(),ignoreCase=true) }
                     }
                     visible.forEach { t->
                         val landlord=t.source=="LANDLORD"
                         ProtectedConversationRow(
-                            title=if(landlord) "Verified Landlord" else "Verified Sublessor",
-                            detail="${if(landlord) "Rental" else "Roommate"} conversation · ${t.id.take(8).uppercase()}",
-                            status=t.status.lowercase().replace('_',' ').replaceFirstChar { it.uppercase() },
-                            enabled=!model.busy
+                            title=t.name ?: if(landlord) "Landlord" else "Sublessor",
+                            detail=t.lastMessage ?: "Start a conversation",
+                            status=t.lastMessageAt?.let { kenyaTime(it, "d MMM yyyy") } ?: "",
+                            enabled=!model.busy,avatarUrl=t.avatar,
+                            onArchive=if(model.showArchived) null else ({ model.archiveThread(t) }),
+                            onRestore=if(model.showArchived) ({ model.restoreThread(t) }) else null,
+                            onDelete={ model.deleteThread(t) }
                         ) { model.openThread(t) }
                     }
-                    if(visible.isEmpty()) SharedText(if(query.isBlank()) "No conversations yet." else "No conversations match your search.",true)
+                    if(visible.isEmpty()) SharedText(if(query.isNotBlank()) "No conversations match your search." else if(model.showArchived) "No archived conversations." else "No conversations yet.",true)
                     if(model.moreThreads) SharedLink("Load more",!model.busy,model::nextThreads)
-                    Gap(12)
-                    SharedNote("Keep communication inside Makao Hub\nChat is free. Phone numbers, email addresses, social handles and exact locations stay masked in messages.")
                 }
                 RenterScreen.CHAT -> {
                     val selectedThread=model.thread ?: return@Column
                     val landlord=selectedThread.source=="LANDLORD"
                     ProtectedConversation(
-                        title=if(landlord) "Verified Landlord" else "Verified Sublessor",
+                        title=selectedThread.name ?: if(landlord) "Landlord" else "Sublessor",
                         roleLabel=if(landlord) "Landlord" else "Sublessor",
                         conversationType=if(landlord) "Rental conversation" else "Roommate conversation",
-                        contextLabel="Conversation ${selectedThread.id.take(8).uppercase()}",
+                        contextLabel=if(landlord) "Rental enquiry" else "Roommate enquiry",
+                        threadId=selectedThread.id,
                         messages=model.messages?.items.orEmpty(),
                         ownUserId=profile.id,
                         connected=model.chatReady,
@@ -170,17 +298,22 @@ import java.util.concurrent.TimeUnit
                         hasOlder=model.messages?.hasNext==true,
                         onOlder=model::olderMessages,
                         onReconnect=model::reconnect,
+                        onAcknowledge=model::acknowledgeMessages,
                         onDraft={ model.chatDraft=it },
                         onSend=model::send
                     )
                 }
                 RenterScreen.PROFILE -> {
-                    RenterHeading("Your profile","Renter")
-                    SharedCard { SharedText(profile.fullName); SharedText(profile.email,true); SharedStatus(model.verification?.status?:"NOT_STARTED") }
-                    SharedLink("Verification",!model.busy) { model.go(RenterScreen.VERIFICATION) }
-                    SharedLink("Saved homes",!model.busy) { model.go(RenterScreen.SAVED) }
-                    SharedLink("Payment history",!model.busy) { model.go(RenterScreen.HISTORY) }
-                    SharedLink("Sign out",!model.busy) { model.clear(); auth.logout() }
+                    AccountProfile(profile, model.verification?.status ?: "NOT_STARTED", model.busy, auth,
+                        documents = model.documents,
+                        onRefreshDocuments = model::refreshVerification,
+                        actions = listOf(
+                            ProfileAction("Saved homes", Icons.Outlined.FavoriteBorder) { model.go(RenterScreen.SAVED) },
+                            ProfileAction("My applications", Icons.Outlined.Description) { model.go(RenterScreen.APPLICATIONS) },
+                            ProfileAction("Payment history", Icons.Outlined.Payments) { model.go(RenterScreen.HISTORY) }
+                        ),
+                        onVerification = { model.go(RenterScreen.VERIFICATION) },
+                        onLogout = { model.clear(); auth.logout() })
                 }
             }
         }
@@ -191,37 +324,64 @@ import java.util.concurrent.TimeUnit
     RenterHeading(when(m.screen) { RenterScreen.HOME->"Find your next chapter"; RenterScreen.SAVED->"Homes you’re saving"; else->"Homes around "+m.filter.area.ifBlank { "you" } },
         if(m.screen==RenterScreen.HOME) "Karibu, "+p.fullName.substringBefore(' ')+". Let’s find somewhere that feels right." else "Whole homes and shared spaces")
     SharedStatus(if(m.verification?.status=="VERIFIED") "Verified Renter" else m.verification?.status?:"NOT_STARTED"); Gap(12)
-    SharedCard {
-        Text("Search",color=Ink,fontSize=14.sp,fontWeight=FontWeight.Medium)
-        SharedLink((m.filter.area.ifBlank { "Choose an area" })+" · "+(m.filter.max.takeIf { it.isNotBlank() }?.let { "Up to KSh $it" }?:"All budgets"),!m.busy) { m.go(RenterScreen.FILTERS) }
+    val keyboard=LocalSoftwareKeyboardController.current
+    OutlinedTextField(value=m.filter.area,onValueChange={m.filter=m.filter.copy(area=it.take(150))},
+        modifier=Modifier.fillMaxWidth(),enabled=!m.busy,singleLine=true,
+        placeholder={Text("Search an area",color=Muted)},
+        leadingIcon={Icon(Icons.Outlined.Search,contentDescription="Search",tint=Brown)},
+        trailingIcon={if(m.filter.area.isNotBlank()) IconButton(onClick={m.filter=m.filter.copy(area="");m.search();keyboard?.hide()}) {
+            Icon(Icons.Outlined.Close,contentDescription="Clear area search",tint=Muted) }},
+        keyboardOptions=KeyboardOptions(imeAction=ImeAction.Search),
+        keyboardActions=KeyboardActions(onSearch={keyboard?.hide();m.search()}),
+        shape=RoundedCornerShape(28.dp),colors=OutlinedTextFieldDefaults.colors(
+            focusedContainerColor=Color.White,unfocusedContainerColor=Color.White,focusedBorderColor=Brown,unfocusedBorderColor=Border))
+    Gap(8)
+    Row(Modifier.fillMaxWidth(),verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.SpaceBetween) {
+        Text(m.filter.max.takeIf { it.isNotBlank() }?.let { "Up to KSh $it" }?:"All budgets",color=Muted,fontSize=12.sp)
+        TextButton(onClick={keyboard?.hide();m.search()},enabled=!m.busy) { Text("Search",color=Brown) }
     }
     Row(verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(12.dp)) {
-        SharedLink("● Filters",!m.busy) { m.go(RenterScreen.FILTERS) }
-        SharedLink("Newest",!m.busy) { m.say("Homes are shown in the server’s current newest-first order.") }
+        SharedLink("Filters",!m.busy) { m.go(RenterScreen.FILTERS) }
+        SharedLink("Relevant",!m.busy) { m.say("Sponsored listings appear first, followed by recently updated homes.") }
         SharedLink("Map view",!m.busy) { m.say("Public map browsing is not available yet. Approximate areas remain private-safe.") }
     }
     Row { listOf(null to "All homes","LANDLORD" to "Whole homes","SUBLESSOR" to "Shared spaces").forEach { (source,label)->
         FilterChip(m.filter.source==source,{m.filter=m.filter.copy(source=source);m.search()},label={Text(label,fontSize=10.sp)},enabled=!m.busy) } }
-    m.homes?.items?.forEach { home->
-        SharedCard {
-            val cover by produceState<HomeMedia?>(null,home.id,home.source) { value=try { m.cover(home) } catch(e:CancellationException) { throw e } catch(_:Exception) { null } }
-            cover?.let { RemoteHomePhoto(it.signedReadUrl) }
-            Row(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.SpaceBetween,verticalAlignment=Alignment.CenterVertically) {
-                RenterStatus("Verified "+home.source.lowercase().replaceFirstChar { it.uppercase() })
-                SharedLink("♡ Save",!m.busy) { m.save(home) }
-            }
-            TextButton(onClick={m.open(home)},enabled=!m.busy,contentPadding=PaddingValues(0.dp)) {
-                Text(home.title,color=Brown,fontSize=18.sp,fontWeight=FontWeight.Medium,lineHeight=24.sp)
-            }
-            SharedText(home.areaLabel+" · "+home.propertyType.lowercase().replace('_',' '),true)
-            Text(kes(home.monthlyRentKes)+" / month",color=Brown,fontSize=18.sp)
-            SharedText((home.bedroomCount?.let { "$it beds · " }?:"")+home.bathroomCount.toString()+" baths · "+home.source.lowercase().replaceFirstChar { it.uppercase() },true)
-            SharedText("Exact location locked",true)
-        }
-    }
+    m.homes?.items?.forEach { home->RenterHomeCard(home,m.isSaved(home),m.busy,{m.open(home)},{m.save(home,m.isSaved(home))},m::cover) }
     if(!m.busy && m.homes?.items?.isEmpty()==true) SharedCard { SharedText("No homes match yet."); SharedText("Try a nearby area or a wider rent range. Your saved filters are safe.",true); SharedLink("Clear filters",true) { m.filter=HomeFilter();m.search() } }
     if(m.homes?.hasNext==true) SharedLink("Next page",!m.busy,m::nextHomes)
     if(m.screen==RenterScreen.HOME) SharedLink("Saved homes · View all",!m.busy) { m.go(RenterScreen.SAVED) }
+}
+
+@Composable private fun RenterHomeCard(home:RenterHome,saved:Boolean,busy:Boolean,onOpen:()->Unit,onSave:()->Unit,cover:suspend (RenterHome)->HomeMedia?) {
+    val photo by produceState<HomeMedia?>(null,home.id,home.source) { value=try { cover(home) } catch(e:CancellationException) { throw e } catch(_:Exception) { null } }
+    Surface(onClick=onOpen,enabled=!busy,modifier=Modifier.fillMaxWidth(),color=Color.White,
+        shape=RoundedCornerShape(20.dp),border=BorderStroke(1.dp,Border)) {
+        Column(Modifier.padding(12.dp),verticalArrangement=Arrangement.spacedBy(8.dp)) {
+            Box(Modifier.fillMaxWidth().height(210.dp).clip(RoundedCornerShape(14.dp)).background(Sand),contentAlignment=Alignment.Center) {
+                if(photo!=null) RemoteHomePhoto(photo!!.signedReadUrl)
+                else Icon(Icons.Outlined.Home,null,tint=Muted,modifier=Modifier.size(36.dp))
+                Surface(shape=RoundedCornerShape(14.dp),color=Color.White.copy(alpha=0.94f),modifier=Modifier.align(Alignment.TopStart).padding(12.dp)) {
+                    IconButton(onClick=onSave,enabled=!busy) { Icon(if(saved) Icons.Outlined.Favorite else Icons.Outlined.FavoriteBorder,
+                        contentDescription=if(saved) "Remove from saved homes" else "Save home",tint=Brown) }
+                }
+            }
+            if(home.sponsored) Text("Boosted · Sponsored",color=Brown,fontSize=11.sp)
+            Row(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.SpaceBetween,verticalAlignment=Alignment.CenterVertically) {
+                Text(home.title,color=Ink,fontSize=17.sp,fontWeight=FontWeight.Bold,modifier=Modifier.weight(1f))
+                Surface(color=Color(0xFFF1E8E3),shape=RoundedCornerShape(7.dp)) {
+                    Row(Modifier.padding(horizontal=8.dp,vertical=6.dp),verticalAlignment=Alignment.CenterVertically) {
+                        Icon(Icons.Outlined.Check,null,Modifier.size(14.dp),tint=Brown);Spacer(Modifier.width(4.dp))
+                        Text("VERIFIED ${home.source.uppercase()}",fontSize=9.sp,color=Ink)
+                    }
+                }
+            }
+            val rooms=(home.bedroomCount?.let { " · $it beds" }?:"")+" · ${home.bathroomCount} baths"
+            Text(home.areaLabel+rooms,color=Muted,fontSize=13.sp)
+            Text(kes(home.monthlyRentKes)+"/mo",color=Brown,fontSize=21.sp,fontWeight=FontWeight.Bold)
+        }
+    }
+    Gap(16)
 }
 @Composable private fun RenterFilters(m:RenterViewModel) {
     RenterHeading(if(m.screen==RenterScreen.AREA) "Where would you like to live?" else "Make it your kind of home","Filter results · choose what matters to you")
@@ -231,7 +391,7 @@ import java.util.concurrent.TimeUnit
     } else {
         RenterInput("Minimum rent · KSh",m.filter.min,!m.busy) { m.filter=m.filter.copy(min=it) }
         RenterInput("Maximum rent · KSh",m.filter.max,!m.busy) { m.filter=m.filter.copy(max=it) }
-        RenterInput("Bedrooms · minimum",m.filter.bedrooms,!m.busy) { m.filter=m.filter.copy(bedrooms=it) }
+        ListingCountDropdown("Bedrooms · minimum",m.filter.bedrooms,0..20,!m.busy,allowAny=true) { m.filter=m.filter.copy(bedrooms=it) }
         var types by remember { mutableStateOf(false) }
         Box { SharedLink(m.filter.propertyType?.lowercase()?.replace('_',' ')?.replaceFirstChar { it.uppercase() }?:"Any property type",!m.busy) { types=true }
             DropdownMenu(types,{types=false}) {
@@ -241,7 +401,6 @@ import java.util.concurrent.TimeUnit
         }
         FilterToggle("Furnished",m.filter.furnished==true,!m.busy) { m.filter=m.filter.copy(furnished=if(it) true else null) }
         RenterInput("Available by · YYYY-MM-DD",m.filter.availableBy,!m.busy) { m.filter=m.filter.copy(availableBy=it) }
-        SharedNote("Parking, water, security and pet filters are not yet supported by the listing search API, so they are not shown as active filters.")
         listOf(null to "Both listing sources","LANDLORD" to "Landlord","SUBLESSOR" to "Sublessor").forEach { (source,title)->
             Row(verticalAlignment=Alignment.CenterVertically) { RadioButton(m.filter.source==source,{m.filter=m.filter.copy(source=source)},enabled=!m.busy); SharedText(title) }
         }
@@ -249,27 +408,133 @@ import java.util.concurrent.TimeUnit
     SharedButton(if(m.screen==RenterScreen.AREA) "Use this area" else "Apply filters",!m.busy,m::search)
     SharedLink("Clear all",!m.busy) { m.filter=HomeFilter() }
 }
+@Composable private fun DetailChip(icon:androidx.compose.ui.graphics.vector.ImageVector,label:String,modifier:Modifier=Modifier) {
+    Surface(color=Color(0xFFFBF3E8),shape=RoundedCornerShape(16.dp),border=BorderStroke(1.dp,Color(0xFFEBD9BF)),modifier=modifier) {
+        Column(Modifier.padding(horizontal=8.dp,vertical=14.dp),horizontalAlignment=Alignment.CenterHorizontally) {
+            Icon(icon,null,tint=Brown,modifier=Modifier.size(26.dp)); Gap(6)
+            Text(label,color=Ink,fontSize=12.sp,fontWeight=FontWeight.SemiBold,textAlign=androidx.compose.ui.text.style.TextAlign.Center)
+        }
+    }
+}
+@Composable private fun AccessTile(icon:androidx.compose.ui.graphics.vector.ImageVector,title:String,sub:String,enabled:Boolean,unlocked:Boolean,onClick:()->Unit) {
+    Surface(onClick=onClick,enabled=enabled,color=Color.White.copy(alpha=0.14f),shape=RoundedCornerShape(16.dp),border=BorderStroke(1.dp,Color.White.copy(alpha=0.28f)),modifier=Modifier.fillMaxWidth()) {
+        Row(Modifier.padding(14.dp),verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(14.dp)) {
+            Surface(color=Color(0xFFF5C26B),shape=CircleShape) { Icon(icon,null,tint=Brown,modifier=Modifier.padding(11.dp).size(22.dp)) }
+            Column(Modifier.weight(1f)) {
+                Text(title,color=Color.White,fontSize=16.sp,fontWeight=FontWeight.Bold)
+                Text(if(unlocked) "Unlocked · tap to view" else sub,color=Color.White.copy(alpha=0.78f),fontSize=12.sp,lineHeight=16.sp)
+            }
+            if(unlocked) Icon(Icons.Outlined.CheckCircle,"Unlocked",tint=Color(0xFF7BD389),modifier=Modifier.size(24.dp))
+            else Icon(Icons.Outlined.Lock,null,tint=Color.White.copy(alpha=0.85f),modifier=Modifier.size(18.dp))
+        }
+    }
+}
 @Composable private fun RenterDetail(m:RenterViewModel) {
     val home=m.selected?:return
-    RenterHeading(home.title,home.areaLabel+" · "+home.propertyType.lowercase().replace('_',' '))
+    val context=LocalContext.current
     var photo by remember(home.id) { mutableIntStateOf(0) }
-    m.photos.getOrNull(photo)?.let { RemoteHomePhoto(it.signedReadUrl) }
-    if(m.photos.size>1) SharedLink("Next photo · "+(photo+1)+" / "+m.photos.size,!m.busy) { photo=(photo+1)%m.photos.size }
-    SharedText(kes(home.monthlyRentKes)+" / month"); Gap(12); SharedStatus("Verified "+home.source.lowercase().replaceFirstChar { it.uppercase() }); Gap(12)
-    SharedCard { Text("The essentials",color=Brown,fontSize=17.sp,fontWeight=FontWeight.Medium); home.availableFrom?.let { SharedText("Availability\nReady from "+it,true) }
-        home.bedroomCount?.let { SharedText(it.toString()+" bedrooms · "+home.bathroomCount+" bathrooms",true) }
-        SharedText(if(home.furnished) "Furnished" else "Unfurnished",true); SharedText(home.description) }
-    RenterAreaMap(LatLng(home.approximateLatitude.toDouble(),home.approximateLongitude.toDouble()))
-    SharedText("Approximate area only. No address or exact pin is shown.",true); Gap(12)
-    SharedLink("Save home",!m.busy) { m.save(false) }; SharedLink("Remove from saved",!m.busy) { m.save(true) }
-    listOf("EXACT_LOCATION_UNLOCK" to "Exact location","VIDEO_UNLOCK" to "Video tour","PHONE_UNLOCK" to "Host phone").forEach { (type,label)->
-        SharedLink(label,!m.busy) { m.openAccess(type) }
+    val saved=m.isSaved(home)
+    Box(Modifier.fillMaxWidth().height(300.dp).clip(RoundedCornerShape(24.dp)).background(Sand)) {
+        m.photos.getOrNull(photo)?.let { RemoteHomePhoto(it.signedReadUrl, Modifier.fillMaxSize()) }
+        if(m.photos.isEmpty()) Text("No photos available",Modifier.align(Alignment.Center),color=Muted)
+        Box(Modifier.fillMaxWidth().height(150.dp).align(Alignment.BottomCenter).background(androidx.compose.ui.graphics.Brush.verticalGradient(listOf(Color.Transparent,Color(0xCC1E0F05)))))
+        Surface(color=Color(0xFF417653),shape=RoundedCornerShape(20.dp),modifier=Modifier.align(Alignment.TopStart).padding(14.dp)) {
+            Row(Modifier.padding(horizontal=12.dp,vertical=7.dp),verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(6.dp)) {
+                Icon(Icons.Outlined.VerifiedUser,null,tint=Color.White,modifier=Modifier.size(16.dp))
+                Text("Verified ${home.source.lowercase().replaceFirstChar { it.uppercase() }}",color=Color.White,fontSize=12.sp,fontWeight=FontWeight.SemiBold)
+            }
+        }
+        Surface(onClick={
+            val message="${home.title} · ${home.areaLabel} · ${kes(home.monthlyRentKes)} / month on Makao Hub"
+            context.startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT,message),"Share listing"))
+        },color=Color.White,shape=CircleShape,modifier=Modifier.align(Alignment.TopEnd).padding(12.dp)) {
+            Icon(Icons.Outlined.Share,"Share listing",Modifier.padding(12.dp).size(22.dp),tint=Brown)
+        }
+        Column(Modifier.align(Alignment.BottomStart).padding(start=18.dp,bottom=16.dp)) {
+            Text(kes(home.monthlyRentKes),color=Color.White,fontSize=30.sp,fontWeight=FontWeight.ExtraBold)
+            Text("per month",color=Color.White.copy(alpha=0.85f),fontSize=13.sp)
+        }
+        if(m.photos.size>1) {
+            Surface(onClick={photo=(photo+1)%m.photos.size},color=Color.White.copy(alpha=0.94f),shape=RoundedCornerShape(20.dp),modifier=Modifier.align(Alignment.BottomEnd).padding(14.dp)) {
+                Text("${photo+1} / ${m.photos.size}  ·  Next",Modifier.padding(horizontal=14.dp,vertical=8.dp),color=Brown,fontSize=12.sp,fontWeight=FontWeight.SemiBold)
+            }
+        }
     }
-    SharedLink("Report listing",!m.busy,m::openReport)
-    SharedNote(if(home.source=="LANDLORD")
-        "Submitting an application opens a free protected conversation with the host. Contact details stay masked."
-        else "Send a free roommate request. Protected chat opens if the host accepts; contact details stay masked.")
-    SharedButton("Start protected chat · Free",!m.busy,m::beginApply)
+    Gap(18)
+    Text(home.title,color=Ink,fontSize=28.sp,lineHeight=33.sp,fontWeight=FontWeight.ExtraBold)
+    Gap(6)
+    Row(verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(6.dp)) {
+        Icon(Icons.Outlined.LocationOn,null,tint=Brown,modifier=Modifier.size(18.dp))
+        Text(home.areaLabel+" · approximate location",color=Muted,fontSize=15.sp)
+    }
+    Gap(18)
+    Row(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.spacedBy(10.dp)) {
+        home.bedroomCount?.let { DetailChip(Icons.Outlined.Bed,"$it bedrooms",Modifier.weight(1f)) }
+        home.bathroomCount?.let { DetailChip(Icons.Outlined.Bathtub,"$it bathrooms",Modifier.weight(1f)) }
+        DetailChip(Icons.Outlined.Chair,if(home.furnished) "Furnished" else "Unfurnished",Modifier.weight(1f))
+    }
+    home.availableFrom?.let {
+        Gap(10)
+        Surface(color=Color(0xFFFFF4D6),shape=RoundedCornerShape(14.dp),border=BorderStroke(1.dp,Color(0xFFF1D58A)),modifier=Modifier.fillMaxWidth()) {
+            Row(Modifier.padding(14.dp),verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(10.dp)) {
+                Icon(Icons.Outlined.CalendarMonth,null,tint=Brown)
+                Text("Available from $it",color=Ink,fontWeight=FontWeight.SemiBold)
+            }
+        }
+    }
+    if(home.description.isNotBlank()) {
+        Gap(20)
+        Text("About this home",color=Ink,fontSize=21.sp,fontWeight=FontWeight.Bold)
+        Gap(8)
+        Text(home.description,color=Ink,fontSize=15.sp,lineHeight=22.sp)
+    }
+    if (m.listingAmenities.isNotEmpty()) {
+        Gap(22)
+        Text("Amenities",color=Ink,fontSize=21.sp,fontWeight=FontWeight.Bold)
+        Gap(10)
+        m.listingAmenities.chunked(2).forEach { pair ->
+            Row(Modifier.fillMaxWidth().padding(bottom=8.dp),horizontalArrangement=Arrangement.spacedBy(8.dp)) {
+                pair.forEach { a ->
+                    Surface(color=Color.White,shape=RoundedCornerShape(14.dp),border=BorderStroke(1.dp,Border),modifier=Modifier.weight(1f)) {
+                        Row(Modifier.padding(horizontal=12.dp,vertical=12.dp),verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(8.dp)) {
+                            Icon(Icons.Outlined.CheckCircle,null,tint=Color(0xFF417653),modifier=Modifier.size(18.dp))
+                            Text(a.name,color=Ink,fontSize=14.sp)
+                        }
+                    }
+                }
+                if(pair.size==1) Spacer(Modifier.weight(1f))
+            }
+        }
+    }
+    Gap(14)
+    Box(Modifier.fillMaxWidth().clip(RoundedCornerShape(24.dp)).background(androidx.compose.ui.graphics.Brush.linearGradient(listOf(Brown,Color(0xFF9A5A26))))) {
+        Column(Modifier.padding(18.dp),verticalArrangement=Arrangement.spacedBy(10.dp)) {
+            Row(verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(10.dp)) {
+                Icon(Icons.Outlined.Lock,null,tint=Color(0xFFF5C26B))
+                Column {
+                    Text("Secure access",color=Color.White,fontSize=21.sp,fontWeight=FontWeight.ExtraBold)
+                    Text("Unlock only what you need. Pay once per item.",color=Color.White.copy(alpha=0.8f),fontSize=13.sp)
+                }
+            }
+            Gap(2)
+            AccessTile(Icons.Outlined.Videocam,"Full video tour","Walk through every room before you visit",!m.busy,m.isUnlocked("VIDEO_UNLOCK")) { m.openAccess("VIDEO_UNLOCK") }
+            AccessTile(Icons.Outlined.Call,"Host contact","Get the owner's phone number",!m.busy,m.isUnlocked("PHONE_UNLOCK")) { m.openAccess("PHONE_UNLOCK") }
+            AccessTile(Icons.Outlined.LocationOn,"Exact location","See the precise address and map pin",!m.busy,m.isUnlocked("EXACT_LOCATION_UNLOCK")) { m.openAccess("EXACT_LOCATION_UNLOCK") }
+        }
+    }
+    Gap(22)
+    SharedButton("Start booking",!m.busy,m::beginApply)
+    Gap(4)
+    Row(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.spacedBy(10.dp)) {
+        OutlinedButton(onClick={ m.save(saved) },enabled=!m.busy,modifier=Modifier.weight(1f).heightIn(min=48.dp),shape=RoundedCornerShape(14.dp),border=BorderStroke(1.dp,Brown)) {
+            Icon(if(saved) Icons.Outlined.Favorite else Icons.Outlined.FavoriteBorder,null,tint=Brown,modifier=Modifier.size(18.dp)); Spacer(Modifier.width(6.dp))
+            Text(if(saved) "Saved" else "Save home",color=Brown)
+        }
+        OutlinedButton(onClick=m::openReport,enabled=!m.busy,modifier=Modifier.weight(1f).heightIn(min=48.dp),shape=RoundedCornerShape(14.dp),border=BorderStroke(1.dp,Border)) {
+            Icon(Icons.Outlined.Flag,null,tint=Muted,modifier=Modifier.size(18.dp)); Spacer(Modifier.width(6.dp))
+            Text("Report",color=Muted)
+        }
+    }
 }
 @Composable private fun FilterToggle(label:String,selected:Boolean,enabled:Boolean,onChange:(Boolean)->Unit) {
     Surface(onClick={onChange(!selected)},enabled=enabled,color=if(selected) Sand else androidx.compose.ui.graphics.Color.White,
@@ -279,22 +544,59 @@ import java.util.concurrent.TimeUnit
         }
     }
 }
+/** The paid phone unlock: one bold card that shows what the renter gets and what it costs. */
+@Composable private fun PhoneUnlockPanel(amountMinor:Long?) {
+    val gold=Color(0xFFF5C26B)
+    Box(Modifier.fillMaxWidth().clip(RoundedCornerShape(26.dp))
+        .background(androidx.compose.ui.graphics.Brush.verticalGradient(listOf(Color(0xFF8A4B1C),Color(0xFF4F2308)))).padding(22.dp)) {
+        Column(Modifier.fillMaxWidth(),horizontalAlignment=Alignment.CenterHorizontally,verticalArrangement=Arrangement.spacedBy(14.dp)) {
+            Surface(color=gold,shape=CircleShape) { Icon(Icons.Outlined.Call,null,tint=Brown,modifier=Modifier.padding(18.dp).size(34.dp)) }
+            Text("Talk to the host directly",color=Color.White,fontSize=22.sp,fontWeight=FontWeight.ExtraBold,textAlign=androidx.compose.ui.text.style.TextAlign.Center)
+            Surface(color=Color.White.copy(alpha=0.14f),shape=RoundedCornerShape(16.dp)) {
+                Row(Modifier.padding(horizontal=18.dp,vertical=12.dp),verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(10.dp)) {
+                    Icon(Icons.Outlined.Lock,null,tint=gold,modifier=Modifier.size(20.dp))
+                    Text("07•• ••• •••",color=Color.White,fontSize=24.sp,fontWeight=FontWeight.Bold,letterSpacing=3.sp)
+                }
+            }
+            Column(verticalArrangement=Arrangement.spacedBy(8.dp)) {
+                listOf("The host’s direct phone number","Unlocked for this home only","Secure, confirmed payment").forEach { line->
+                    Row(verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(10.dp)) {
+                        Icon(Icons.Outlined.CheckCircle,null,tint=Color(0xFF7FD19A),modifier=Modifier.size(20.dp))
+                        Text(line,color=Color.White,fontSize=15.sp)
+                    }
+                }
+            }
+            amountMinor?.let { Surface(color=gold,shape=RoundedCornerShape(50)) {
+                Text("Unlock for ${minor(it)}",color=Brown,fontSize=16.sp,fontWeight=FontWeight.ExtraBold,modifier=Modifier.padding(horizontal=18.dp,vertical=9.dp))
+            } }
+        }
+    }
+    Gap(8)
+    SharedText("Chats continue to mask contact details.",true)
+    Gap(12)
+}
 @Composable private fun RenterUnlockIntro(m:RenterViewModel) {
     val home=m.selected?:return
     val location=m.unlockType=="EXACT_LOCATION_UNLOCK"
     val video=m.unlockType=="VIDEO_UNLOCK"
     val title=when { location->"Get to know the neighbourhood";video->"Take a closer look";else->"Contact is protected" }
-    RenterHeading(title,when { location->"Unlock the exact location of ${home.title}.";video->"${home.title} · video tour locked";else->"Host contact · masked until you unlock this listing." })
-    if(video) m.photos.firstOrNull()?.let { RemoteHomePhoto(it.signedReadUrl) }
-    else RenterAreaMap(LatLng(home.approximateLatitude.toDouble(),home.approximateLongitude.toDouble()))
+    HeroBanner(Brown,if(location) Icons.Outlined.LocationOn else if(video) Icons.Outlined.Videocam else Icons.Outlined.Call,title,
+        when { location->"Unlock the exact location of ${home.title}.";video->"${home.title} · video tour locked";else->"Host contact · masked until you unlock this listing." })
+    if(!location && !video) PhoneUnlockPanel(m.price?.amountMinor) else {
+    if(video) m.photos.firstOrNull()?.let { RemoteHomePhoto(it.signedReadUrl,Modifier.fillMaxWidth().height(210.dp).clip(RoundedCornerShape(20.dp))); Gap(12) }
+    else { Box(Modifier.fillMaxWidth().clip(RoundedCornerShape(20.dp))) { RenterAreaMap(LatLng(home.approximateLatitude.toDouble(),home.approximateLongitude.toDouble())) }; Gap(8) }
     SharedText(if(location) "Approximate area only. No address or coordinates are shown." else if(video) "A listing video is available only after a paid video entitlement." else "Phone access is shown only in its dedicated view. Chats continue to mask contact details.",true)
-    SharedCard {
-        Text(if(location) "What you’ll unlock" else if(video) "Inside the home" else "Host contact",color=Brown,fontSize=18.sp)
+    Gap(12)
+    HighlightCard {
+        Row(verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(10.dp)) {
+            Surface(color=Color(0xFFF5C26B),shape=CircleShape) { Icon(Icons.Outlined.LockOpen,null,tint=Brown,modifier=Modifier.padding(9.dp).size(20.dp)) }
+            Text(if(location) "What you’ll unlock" else if(video) "Inside the home" else "Host contact",color=Ink,fontSize=19.sp,fontWeight=FontWeight.ExtraBold)
+        }
         SharedText(if(location) "Exact map pin\nAvailable only after a Paid location entitlement." else if(video) "Video access\nUnlocked only for this listing after confirmed payment." else "Phone number\nShown only after a Paid phone entitlement for this listing.")
     }
-    SharedNote(if(BuildConfig.MOCK_PAYMENTS_ENABLED) "An informed choice\nThis is a test/mock checkout, not a reservation. The server supplies the illustrative price." else "Separate access\nLocation, video and phone use separate entitlements. Buying one does not grant another.")
+    }
     val amount=m.price?.amountMinor
-    SharedButton("Continue"+(amount?.let { " · TEST "+minor(it) }?:""),!m.busy && amount!=null,m::continueToCheckout)
+    SharedButton("Continue"+(amount?.let { " · "+minor(it) }?:""),!m.busy && amount!=null,m::continueToCheckout)
     SharedLink("Not now",!m.busy) { m.go(RenterScreen.DETAIL) }
 }
 @Composable private fun RenterReport(m:RenterViewModel) {
@@ -306,69 +608,177 @@ import java.util.concurrent.TimeUnit
         Row(verticalAlignment=Alignment.CenterVertically) { RadioButton(m.reportCategory==value,{m.reportCategory=value},enabled=!m.busy);SharedText(label) }
     }
     RenterInput("Tell us more",m.reportDescription,!m.busy,4) { m.reportDescription=it.take(1000) }
-    SharedNote("Your report is private. Staff review the listing and keep an audit record. The host is not shown your identity in the report. Do not include identity numbers, contact details or private documents.")
+    SharedNote("Your report is private. Please don’t include ID numbers or contact details.")
     SharedButton("Submit report",!m.busy && m.reportDescription.isNotBlank(),m::submitReport)
+}
+@Composable private fun StepDot(label:String,state:Int,modifier:Modifier=Modifier) {
+    // state: 0 upcoming, 1 current, 2 done, 3 declined
+    val color=when(state) { 2->Color(0xFF417653); 1->Color(0xFFA56C10); 3->Color(0xFFB24D45); else->Color(0xFFD9CFC2) }
+    Column(modifier,horizontalAlignment=Alignment.CenterHorizontally) {
+        Surface(color=if(state==0) Color.White else color,shape=CircleShape,border=BorderStroke(2.dp,color)) {
+            Icon(when(state) { 2->Icons.Outlined.Check; 3->Icons.Outlined.Close; 1->Icons.Outlined.HourglassTop; else->Icons.Outlined.Circle },null,
+                tint=if(state==0) color else Color.White,modifier=Modifier.padding(7.dp).size(18.dp))
+        }
+        Gap(6)
+        Text(label,color=if(state==0) Muted else Ink,fontSize=12.sp,fontWeight=FontWeight.SemiBold,textAlign=androidx.compose.ui.text.style.TextAlign.Center)
+    }
+}
+@Composable private fun ApplicationFact(icon:androidx.compose.ui.graphics.vector.ImageVector,label:String,value:String) {
+    Row(Modifier.fillMaxWidth().padding(vertical=6.dp),verticalAlignment=Alignment.Top,horizontalArrangement=Arrangement.spacedBy(12.dp)) {
+        Surface(color=Color(0xFFFBF3E8),shape=CircleShape) { Icon(icon,null,tint=Brown,modifier=Modifier.padding(8.dp).size(18.dp)) }
+        Column { Text(label,color=Muted,fontSize=12.sp); Text(value,color=Ink,fontSize=15.sp,fontWeight=FontWeight.SemiBold) }
+    }
 }
 @Composable private fun RenterApplicationDetail(m:RenterViewModel) {
     val a=m.application?:return
-    RenterHeading(if(a.value.status=="APPROVED") "You’re approved" else "Your application",a.source.lowercase().replaceFirstChar { it.uppercase() }+" home")
-    SharedCard { RenterStatus(a.value.status); SharedText("Submitted · "+a.value.createdAt,true); SharedText("Updated · "+a.value.updatedAt,true)
-        a.value.rejectionReason?.let { SharedText(it) } }
-    if(a.value.status=="APPROVED") SharedButton("Continue to booking",!m.busy,m::book)
-    if(a.value.status in listOf("SUBMITTED","UNDER_REVIEW","APPROVED")) {
+    val status=a.value.status
+    val declined=status in listOf("REJECTED","DECLINED")
+    val approved=status=="APPROVED"
+    val look=appStatusLook(status)
+    val homeName=a.source.lowercase().replaceFirstChar { it.uppercase() }+" home"
+    val headline=when { approved->"You’re approved"; declined->"Application declined"; status=="WITHDRAWN"->"Application withdrawn"; else->"Waiting for the host" }
+    Box(Modifier.fillMaxWidth().clip(RoundedCornerShape(24.dp)).background(androidx.compose.ui.graphics.Brush.linearGradient(listOf(look.color,look.color.copy(alpha=0.72f))))) {
+        Row(Modifier.padding(20.dp),verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(16.dp)) {
+            Surface(color=Color.White.copy(alpha=0.22f),shape=CircleShape) { Icon(look.icon,null,tint=Color.White,modifier=Modifier.padding(14.dp).size(32.dp)) }
+            Column {
+                Text(headline,color=Color.White,fontSize=24.sp,fontWeight=FontWeight.ExtraBold,lineHeight=28.sp)
+                Text(homeName,color=Color.White.copy(alpha=0.88f),fontSize=14.sp)
+            }
+        }
+    }
+    Gap(16)
+    Row(Modifier.fillMaxWidth(),verticalAlignment=Alignment.Top) {
+        StepDot("Submitted",2,Modifier.weight(1f))
+        StepDot(if(declined) "Declined" else "Host decision",if(approved) 2 else if(declined) 3 else if(status=="WITHDRAWN") 0 else 1,Modifier.weight(1f))
+        StepDot("Book & pay",if(approved) 1 else 0,Modifier.weight(1f))
+    }
+    Gap(16)
+    m.applicationCoverUrl?.let { RemoteHomePhoto(it,Modifier.fillMaxWidth().height(190.dp).clip(RoundedCornerShape(20.dp))); Gap(12) }
+    m.applicationHome?.let { h->
+        if(h.bookedByYou) {
+            Surface(color=Color(0xFFE4F2E8),shape=RoundedCornerShape(16.dp),modifier=Modifier.fillMaxWidth()) {
+                Row(Modifier.padding(14.dp),verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(10.dp)) {
+                    Icon(Icons.Outlined.CheckCircle,null,tint=Color(0xFF417653))
+                    Text("This home was booked by you. It is no longer listed for other renters.",color=Color(0xFF417653),fontSize=14.sp,fontWeight=FontWeight.SemiBold)
+                }
+            }
+            Gap(12)
+        }
+        Surface(color=Color(0xFFFBF3E8),shape=RoundedCornerShape(18.dp),border=BorderStroke(1.dp,Color(0xFFEBD9BF)),modifier=Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(16.dp),verticalArrangement=Arrangement.spacedBy(4.dp)) {
+                Text(h.title,color=Ink,fontSize=19.sp,fontWeight=FontWeight.ExtraBold)
+                Text(kes(h.monthlyRentKes)+" / month",color=Brown,fontSize=17.sp,fontWeight=FontWeight.Bold)
+                Row(verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(4.dp)) {
+                    Icon(Icons.Outlined.LocationOn,null,tint=Muted,modifier=Modifier.size(15.dp)); Text(h.areaLabel,color=Muted,fontSize=13.sp)
+                }
+            }
+        }
+        Gap(12)
+    }
+    AppAccentCard(status) {
+        AppStatusBadge(status)
+        ApplicationFact(Icons.Outlined.Send,"Submitted",kenyaTime(a.value.createdAt))
+        ApplicationFact(Icons.Outlined.Update,"Last updated",kenyaTime(a.value.updatedAt))
+        moveInLabel(a.value.moveInDate)?.let { ApplicationFact(Icons.Outlined.CalendarMonth,"Move-in date",it) }
+        a.value.message?.takeIf { it.isNotBlank() }?.let { ApplicationFact(Icons.Outlined.ChatBubbleOutline,"Your message",it) }
+    }
+    Surface(color=look.soft,shape=RoundedCornerShape(16.dp),modifier=Modifier.fillMaxWidth()) {
+        Row(Modifier.padding(16.dp),verticalAlignment=Alignment.Top,horizontalArrangement=Arrangement.spacedBy(12.dp)) {
+            Icon(look.icon,null,tint=look.color)
+            Text(when {
+                approved -> "Approved — next step: book and pay securely with Paystack. Your payment is held until you move in."
+                declined -> a.value.rejectionReason?.takeIf { it.isNotBlank() }?.let { "Reason: $it" } ?: "The host did not approve this application."
+                status=="WITHDRAWN" -> "You withdrew this application."
+                else -> "Waiting for the host’s decision."
+            },color=Ink,fontSize=14.sp,lineHeight=20.sp)
+        }
+    }
+    Gap(14)
+    if(approved) SharedButton("Continue to booking & payment",!m.busy,m::book)
+    if(declined) SharedButton("Browse similar homes",!m.busy) { m.go(RenterScreen.HOME) }
+    if(status in listOf("SUBMITTED","UNDER_REVIEW")) {
         var withdraw by remember { mutableStateOf(false) }
-        SharedLink("Withdraw application",!m.busy) { withdraw=true }
-        if(withdraw) AlertDialog(onDismissRequest={withdraw=false},title={Text("Withdraw application?")},text={Text("This does not create a refund.")},
+        TextButton(onClick={ withdraw=true },enabled=!m.busy,modifier=Modifier.fillMaxWidth()) { Text("Withdraw application",color=Color(0xFFB24D45),fontWeight=FontWeight.SemiBold) }
+        if(withdraw) AlertDialog(onDismissRequest={withdraw=false},title={Text("Withdraw application?")},text={Text("The host will no longer see this application.")},
             confirmButton={TextButton({withdraw=false;m.withdraw()}) {Text("Confirm withdrawal")}},dismissButton={TextButton({withdraw=false}) {Text("Keep application")}})
     }
 }
 @Composable private fun RenterBookingDetail(m:RenterViewModel) {
     val b=m.booking?:return
-    RenterHeading(if(b.status=="PAID_HELD") "Payment held" else if(b.status=="ACTIVE") "Your payment was released" else "Review your booking","Booking · "+b.id.take(8))
-    MockNotice()
-    SharedCard { RenterStatus(if(b.status=="PAID_HELD") "Held" else if(b.status=="ACTIVE") "Released" else b.status); SharedText("Rent · "+minor(b.rentAmountMinor)); SharedText("Deposit · "+minor(b.depositAmountMinor))
-        SharedText("Makao Hub fee · "+minor(b.commissionAmountMinor)); SharedText("Total · "+minor(b.totalAmountMinor)) }
-    if(b.status in listOf("AWAITING_PAYMENT","PAYMENT_PENDING") && BuildConfig.MOCK_PAYMENTS_ENABLED)
-        SharedButton("Continue to TEST checkout",!m.busy,m::bookingCheckout)
-    if(b.status=="PAID_HELD" && b.renterAgreedAt==null) {
-        var agree by remember { mutableStateOf(false) }
-        Row(verticalAlignment=Alignment.CenterVertically) { Checkbox(agree,{agree=it},enabled=!m.busy);SharedText("I agree to these booking terms") }
-        SharedButton("Confirm booking agreement",!m.busy && agree,m::agree)
-    }
-    if(b.status=="PAID_HELD" && b.ownerAgreedAt==null) SharedText("Owner agreement pending",true)
-    if(b.status=="PAID_HELD" && b.moveInConfirmedAt==null) {
-        var hasAccess by remember { mutableStateOf(false) }; var matches by remember { mutableStateOf(false) }
-        SharedCard {
-            Text("Before you confirm",color=Brown,fontSize=18.sp)
-            FilterToggle("I have access to the home",hasAccess,!m.busy) { hasAccess=it }
-            FilterToggle("The home matches my booking",matches,!m.busy) { matches=it }
-            SharedText("Confirm only after you move in. If anything is wrong, raise a dispute before any release.")
+    val held=b.status=="PAID_HELD"; val active=b.status=="ACTIVE"
+    HeroBanner(if(active) Color(0xFF417653) else if(held) Color(0xFFA56C10) else Brown,
+        if(active) Icons.Outlined.CheckCircle else if(held) Icons.Outlined.Lock else Icons.Outlined.Receipt,
+        if(held) "Payment held" else if(active) "Your payment was released" else "Review your booking","Your move-in booking")
+    if(held || active) {
+        Row(Modifier.fillMaxWidth(),verticalAlignment=Alignment.Top) {
+            StepDot("Paid",2,Modifier.weight(1f))
+            StepDot("Owner confirms",if(b.ownerMoveInConfirmedAt!=null) 2 else 1,Modifier.weight(1f))
+            StepDot("You confirm",if(b.moveInAnsweredAt!=null) (if(b.moveInAccepted==false) 3 else 2) else if(b.ownerMoveInConfirmedAt!=null) 1 else 0,Modifier.weight(1f))
+            StepDot("Released",if(active) 2 else 0,Modifier.weight(1f))
         }
-        SharedButton("Yes, confirm move-in",!m.busy && hasAccess && matches,m::moveIn)
-        SharedNote("A considered confirmation\nThis records your move-in with the server and starts its configured release timer. It does not itself transfer funds.")
+        Gap(16)
     }
+    HighlightCard {
+        RenterStatus(if(held) "Held" else if(active) "Released" else b.status)
+        AmountRow("Rent",minor(b.rentAmountMinor)); AmountRow("Deposit",minor(b.depositAmountMinor)); AmountRow("Makao Hub fee",minor(b.commissionAmountMinor))
+        HorizontalDivider(color=Border)
+        AmountRow("Total",minor(b.totalAmountMinor),true)
+    }
+    if(b.status in listOf("AWAITING_PAYMENT","PAYMENT_PENDING"))
+        SharedButton("Continue to payment",!m.busy,m::bookingCheckout)
+    if(b.status=="PAID_HELD" && b.ownerMoveInConfirmedAt==null) SharedText("Waiting for the owner to confirm you have moved in.",true)
+    if(b.status=="PAID_HELD" && b.ownerMoveInConfirmedAt!=null && b.moveInAnsweredAt==null) {
+        var ask by remember(b.id) { mutableStateOf(true) }
+        HighlightCard {
+            Text("Did you move in?",color=Ink,fontSize=19.sp,fontWeight=FontWeight.ExtraBold)
+            SharedText("The owner says you have moved in. Answer True only if that is correct.")
+            SharedButton("True, I moved in",!m.busy) { m.answerMoveIn(true) }
+            SharedLink("False, I have not moved in",!m.busy) { m.answerMoveIn(false) }
+        }
+        if(ask) MoveInQuestionDialog("The owner says you have moved in. Is that right?",m.busy,{ ask=false;m.answerMoveIn(it) },{ ask=false })
+    }
+    if(b.moveInAccepted==false) SharedNote("You answered False\nNo money has been released. Your payment stays safely held while our team reviews.")
+    if(b.moveInAccepted==true && b.status!="ACTIVE") SharedNote("Thank you for confirming\nYour payment is being released to the owner through Paystack.")
     b.releaseEligibleAt?.let { SharedText("Release eligible after · "+it,true) }
-    b.releasedAt?.let { SharedText("Released · "+it,true) }
+    b.releasedAt?.let { SharedText("Released · "+kenyaTime(it),true) }
     SharedLink("Refresh booking",!m.busy,m::refreshBooking)
-    if(b.status=="PAID_HELD") SharedNote("Move-in confirmation does not itself release money. Dispute and refund handling stays unavailable until the regulated custody and resolution rules are confirmed.")
 }
 @Composable private fun RenterCheckout(m:RenterViewModel) {
-    RenterHeading(if(m.screen==RenterScreen.CHECKOUT) "Access checkout" else "Payment status",m.unlockType.lowercase().replace('_',' '))
-    MockNotice()
+    val checkoutReturn = LocalCheckoutReturnSignal.current
+    LaunchedEffect(checkoutReturn) {
+        if (checkoutReturn > 0 && m.payment?.status in listOf("CREATED", "PENDING")) m.refreshPayment()
+    }
+    LaunchedEffect(m.payment?.id,m.payment?.status,m.screen) {
+        if(m.screen==RenterScreen.PAYMENT && m.payment?.status in listOf("CREATED","PENDING")) m.watchPayment()
+    }
+    if(m.screen==RenterScreen.CHECKOUT) HeroBanner(Brown,Icons.Outlined.Lock,if(m.unlockType=="BOOKING") "Pay for your booking" else "Unlock access",if(m.unlockType=="BOOKING") "Rent and deposit" else paymentTitle(m.unlockType))
+    else {
+        val st=m.payment?.status
+        HeroBanner(when(st) { "SUCCEEDED"->Color(0xFF417653);"FAILED"->Color(0xFFB24D45);else->Color(0xFFA56C10) },
+            when(st) { "SUCCEEDED"->Icons.Outlined.CheckCircle;"FAILED"->Icons.Outlined.Cancel;else->Icons.Outlined.HourglassTop },
+            when(st) { "SUCCEEDED"->"Payment received";"FAILED"->"Payment failed";else->"Waiting for Paystack" },
+            when(st) { "SUCCEEDED"->"Thank you, your payment is complete.";"FAILED"->"No money was taken.";else->"We confirm your payment automatically, no need to tap anything." })
+    }
     if(m.screen==RenterScreen.CHECKOUT) {
         val amount=if(m.unlockType=="BOOKING") m.booking?.totalAmountMinor else m.price?.amountMinor
-        amount?.let { SharedCard {
-            Text(if(m.unlockType=="BOOKING") "Your booking breakdown" else paymentTitle(m.unlockType),color=Brown,fontSize=18.sp)
-            SharedText("One listing · server-configured price")
+        amount?.let { HighlightCard {
+            Text(if(m.unlockType=="BOOKING") "Your booking breakdown" else paymentTitle(m.unlockType),color=Muted,fontSize=14.sp)
+            Text(minor(it),color=Brown,fontSize=32.sp,fontWeight=FontWeight.ExtraBold)
             HorizontalDivider(color=Border)
-            SharedText("Total · "+minor(it))
-            SharedText(if(BuildConfig.MOCK_PAYMENTS_ENABLED) "Mock M-Pesa simulation only · no STK push or money movement." else "Payment is initiated and confirmed by the server provider flow.",true)
+            Row(verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(8.dp)) {
+                Icon(Icons.Outlined.VerifiedUser,null,tint=Color(0xFF417653),modifier=Modifier.size(18.dp))
+                Text("Secured by Paystack",color=Ink,fontSize=13.sp)
+            }
         } }
-        val enabled=!m.busy && amount!=null && (BuildConfig.MOCK_PAYMENTS_ENABLED || m.unlockType in RenterRepository.UNLOCKS)
-        SharedButton(amount?.let { (if(BuildConfig.MOCK_PAYMENTS_ENABLED) "Simulate payment · " else "Pay with Paystack · ")+minor(it) }?:"Price unavailable",enabled,m::createPayment)
+        val enabled=!m.busy && amount!=null
+        SharedButton(amount?.let { "Pay with Paystack · "+minor(it) }?:"Price unavailable",enabled,m::createPayment)
     } else m.payment?.let { p->
-        SharedCard { RenterStatus(paymentStatus(p)); SharedText(minor(p.amountMinor)); SharedText("Reference · "+p.id.take(8),true); p.providerDisplayText?.let { SharedText(it,true) } }
-        if(p.status=="PENDING" && !BuildConfig.MOCK_PAYMENTS_ENABLED && !p.authorizationUrl.isNullOrBlank()) {
+        HighlightCard {
+            RenterStatus(paymentStatus(p))
+            Text(minor(p.amountMinor),color=Brown,fontSize=32.sp,fontWeight=FontWeight.ExtraBold)
+            SharedText(paymentTitle(p.paymentType),true); p.providerDisplayText?.let { SharedText(it,true) }
+        }
+        if(p.status=="PENDING" && !p.authorizationUrl.isNullOrBlank()) {
             val context=LocalContext.current
             SharedButton("Continue to secure payment",!m.busy) {
                 runCatching {
@@ -378,30 +788,32 @@ import java.util.concurrent.TimeUnit
                     .onFailure { m.say("Could not open the secure payment page. Refresh the payment status before retrying.") }
             }
         }
-        if(p.status=="PENDING" && BuildConfig.MOCK_PAYMENTS_ENABLED) {
-            SharedButton("Simulate successful TEST payment",!m.busy && BuildConfig.MOCK_PAYMENTS_ENABLED) { m.simulatePayment(MockPaymentResult.SUCCESS) }
-            SharedLink("Simulate failed TEST payment",!m.busy && BuildConfig.MOCK_PAYMENTS_ENABLED) { m.simulatePayment(MockPaymentResult.FAILED) }
-        }
-        SharedLink(if(BuildConfig.MOCK_PAYMENTS_ENABLED) "Refresh test status" else "Check Paystack payment",!m.busy,m::refreshPayment)
+        SharedLink("Check payment status",!m.busy,m::refreshPayment)
         if(p.status=="SUCCEEDED") {
             if(p.paymentType=="BOOKING") SharedButton("View booking",!m.busy) { m.go(RenterScreen.BOOKING) }
             else SharedButton("View unlocked access",!m.busy,m::viewPaidAccess)
         }
         if(p.status=="FAILED") {
-            SharedNote("No money moved and no access was granted. Retry with a new attempt; the failed reference remains in your payment history.")
-            SharedButton("Retry payment",!m.busy) { m.go(RenterScreen.DETAIL) }
+            SharedNote("The payment did not go through and no money was taken.")
+            SharedButton("Retry payment",!m.busy) { m.go(if(p.paymentType=="BOOKING") RenterScreen.BOOKING else RenterScreen.DETAIL) }
         }
-        if(p.status=="PENDING") SharedNote("Don’t pay again yet. Keep access locked and refresh this same payment reference.")
+        if(p.status=="PENDING") SharedNote("This updates by itself after you pay. You can also tap Check payment status. Please don’t pay twice.")
     }
 }
 @Composable private fun RenterAccess(m:RenterViewModel) {
-    RenterHeading(when(m.unlockType) {"PHONE_UNLOCK"->"Your unlocked contact";"VIDEO_UNLOCK"->"Your video tour";else->"Your unlocked location"},"Server-authorised access")
+    HeroBanner(Color(0xFF417653),Icons.Outlined.CheckCircle,when(m.unlockType) {"PHONE_UNLOCK"->"Your unlocked contact";"VIDEO_UNLOCK"->"Your video tour";else->"Your unlocked location"},"Unlocked for this home")
     m.location?.let { location->
         val context=LocalContext.current
-        RenterAreaMap(LatLng(location.latitude.toDouble(),location.longitude.toDouble()),exact=true)
-        SharedCard {
-            Text(location.areaLabel,color=Brown,fontSize=18.sp,fontWeight=FontWeight.Medium)
-            SharedText("Exact pin · ${location.latitude}, ${location.longitude}")
+        Box(Modifier.fillMaxWidth().clip(RoundedCornerShape(20.dp))) { RenterAreaMap(LatLng(location.latitude.toDouble(),location.longitude.toDouble()),exact=true) }
+        Gap(12)
+        HighlightCard {
+            Row(verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(12.dp)) {
+                Surface(color=Color(0xFFF5C26B),shape=CircleShape) { Icon(Icons.Outlined.LocationOn,null,tint=Brown,modifier=Modifier.padding(10.dp).size(22.dp)) }
+                Column {
+                    Text(location.areaLabel,color=Ink,fontSize=19.sp,fontWeight=FontWeight.ExtraBold)
+                    Text("Exact pin · ${location.latitude}, ${location.longitude}",color=Muted,fontSize=13.sp)
+                }
+            }
             SharedText("Viewing\nArrange a time using protected chat.")
         }
         SharedButton("Open directions",true) {
@@ -409,70 +821,73 @@ import java.util.concurrent.TimeUnit
                 .onFailure { m.say("No maps app is available on this device.") }
         }
     }
-    m.phone?.let { SharedCard { SharedText(it.ownerName); SharedText(it.phoneNumber) } }
-    m.videos.forEach { ProtectedVideo(it.signedReadUrl) }
+    m.phone?.let { HighlightCard {
+        Row(verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(14.dp)) {
+            Surface(color=Color(0xFFF5C26B),shape=CircleShape) { Icon(Icons.Outlined.Call,null,tint=Brown,modifier=Modifier.padding(12.dp).size(26.dp)) }
+            Column {
+                Text(it.ownerName,color=Ink,fontSize=20.sp,fontWeight=FontWeight.ExtraBold)
+                Text(it.phoneNumber,color=Brown,fontSize=19.sp,fontWeight=FontWeight.SemiBold)
+            }
+        }
+    } }
+    m.videos.forEach { Box(Modifier.fillMaxWidth().clip(RoundedCornerShape(20.dp))) { ProtectedVideo(it.signedReadUrl) }; Gap(12) }
     if(m.unlockType=="VIDEO_UNLOCK" && m.videos.isEmpty()) SharedText("No video is available.",true)
-    SharedNote("Location, video and phone use separate server-checked access. This view is available only after payment for this listing. Contact details remain masked in chat.")
     SharedLink("Back to listing",true) { m.go(RenterScreen.DETAIL) }
 }
 @Composable private fun RenterVerification(m:RenterViewModel) {
     var camera by remember { mutableStateOf<RenterEvidence?>(null) }
     var choosing by remember { mutableStateOf<RenterEvidence?>(null) }
     var correcting by remember { mutableStateOf(false) }
-    var step by rememberSaveable { mutableIntStateOf(0) }
+    var started by rememberSaveable { mutableStateOf(false) }
     var sourceFor by remember { mutableStateOf<RenterEvidence?>(null) }
     val resolver=LocalContext.current.contentResolver
     val picker=rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri->val type=choosing;choosing=null;if(uri!=null && type!=null) m.upload(type,resolver,uri) }
     val status=m.verification?.status
     val terminal=status in listOf("PENDING","VERIFIED") || status=="REJECTED" && !correcting
+    val editable=status in listOf("NOT_STARTED","REJECTED")
+    fun capture(type:RenterEvidence) {
+        val stored=m.documents.firstOrNull { it.documentType==type.name }
+        when {
+            m.pendingEvidenceType==type.name -> m.retryEvidence()
+            stored?.status=="UPLOADING" -> m.confirmStored(stored.documentId)
+            type==RenterEvidence.SELFIE -> camera=type
+            else -> sourceFor=type
+        }
+    }
     val back={ if(!m.busy) {
-        if(camera!=null) camera=null else if(!terminal && step>0) step-- else m.go(RenterScreen.HOME)
+        if(camera!=null) camera=null else if(started && !terminal) started=false else m.go(RenterScreen.HOME)
     } }
     BackHandler(onBack=back)
     sourceFor?.let { type->IdSourceDialog(type.title,{sourceFor=null},
         {sourceFor=null;camera=type},{sourceFor=null;choosing=type;picker.launch(arrayOf("image/jpeg","image/png"))}) }
-    PageBody(back,!m.busy) {
+    VerificationPageBody(back, { m.go(RenterScreen.HOME) }, !m.busy, if (!started && !terminal) "Verification" else "Capture documents") {
     m.notice?.let { SharedNote(it); Gap(8) }
     when {
         terminal -> VerificationOutcomeScreen(
             role="Renter", status=status!!, rejectionReason=m.verification?.rejectionReason,
             busy=m.busy, approvedAction="Explore homes",
-            onApproved={m.go(RenterScreen.HOME)}, onCorrect={correcting=true;step=1},
+            onApproved={m.go(RenterScreen.HOME)}, onCorrect={correcting=true},
             onClose={m.go(RenterScreen.HOME)}, onRefresh=m::refreshVerification)
-        step==0 -> VerificationIntro(
-            role="Renter",
-            subtitle="Helps hosts know they are receiving applications from a verified person.",
-            roleDocument=null,
-            onStart={step=1})
+        !started && editable -> VerificationIntro("Renter", "Confirms your identity for your renter account.", null) { started = true }
         camera!=null -> {
             val type=camera!!
-            Heading(when(type) { RenterEvidence.ID_FRONT->"Front of your ID"; RenterEvidence.ID_BACK->"Back of your ID";else->"Capture Live Photo" });Gap(20)
-            key(type) { EvidenceCamera(type==RenterEvidence.SELFIE,!m.busy,{bitmap->camera=null;m.capture(type,bitmap)},m::say) }
+            Heading(if(type==RenterEvidence.SELFIE) "Capture selfie" else type.title);Gap(20)
+            key(type) { EvidenceCamera(type==RenterEvidence.SELFIE,editable&&!m.busy,{bitmap->camera=null;m.capture(type,bitmap)},m::say) }
             SharedLink("Cancel camera",!m.busy) { camera=null }
         }
-        step<=2 -> {
-            val type=if(step==1) RenterEvidence.ID_FRONT else RenterEvidence.ID_BACK
-            IdDocumentStep(step==2,m.documents.firstOrNull { it.documentType==type.name },
-                pending=m.pendingEvidenceType==type.name,busy=m.busy,editable=status in listOf("NOT_STARTED","REJECTED"),
-                progress=m.evidenceProgress,stage=m.evidenceStage,name=m.evidenceNames[type],frontReady=renterEvidenceReady(RenterEvidence.ID_FRONT,m.documents),
-                choose={sourceFor=type},retry={
-                    if(m.pendingEvidenceType==type.name) m.retryEvidence()
-                    else m.documents.firstOrNull { it.documentType==type.name }?.let { m.confirmStored(it.documentId) }
-                },next={step++})
+        else -> {
+            val types=listOf(RenterEvidence.ID_FRONT,RenterEvidence.ID_BACK,RenterEvidence.SELFIE)
+            IdentityCaptureChecklist(
+                role="Renter",busy=m.busy,editable=editable,stage=m.evidenceStage,progress=m.evidenceProgress,
+                items=types.map { type->IdentityCaptureItem(
+                    type.name,
+                    when(type) { RenterEvidence.ID_FRONT->"National ID (front)";RenterEvidence.ID_BACK->"National ID (back)";else->"Selfie" },
+                    when(type) { RenterEvidence.ID_FRONT->"Photo side, fit the card inside the frame";RenterEvidence.ID_BACK->"Turn the card over, all four corners visible";else->"Remove spectacles, face the camera" },
+                    m.pendingEvidenceType!=type.name && renterEvidenceReady(type,m.documents),
+                    m.busy && m.pendingEvidenceType==type.name
+                ) },
+                onCapture={key->capture(RenterEvidence.valueOf(key))},onContinue=m::submitEvidence)
         }
-        step==3 -> {
-            val selfieReady=renterEvidenceReady(RenterEvidence.SELFIE,m.documents)
-            VerificationSelfieStep(selfieReady,m.busy) {
-                if(selfieReady) step=4 else camera=RenterEvidence.SELFIE
-            }
-            if(m.pendingEvidence!=null) SharedButton("Retry current document",!m.busy,m::retryEvidence)
-            else m.documents.filter { it.status=="UPLOADING" }.forEach { doc->
-                SharedLink("Confirm "+doc.documentType.lowercase().replace('_',' '),!m.busy) { m.confirmStored(doc.documentId) }
-            }
-        }
-        else -> VerificationReviewSummary(
-            roleDocument=null, ready=renterEvidenceComplete(m.documents), busy=m.busy,
-            submit=m::submitEvidence, replace={step=1})
     }
     }
 }
@@ -480,7 +895,6 @@ import java.util.concurrent.TimeUnit
 @Composable private fun RenterInput(label:String,value:String,enabled:Boolean,lines:Int=1,onChange:(String)->Unit) {
     OutlinedTextField(value,onChange,enabled=enabled,label={Text(label)},singleLine=lines==1,minLines=lines,shape=RoundedCornerShape(10.dp),modifier=Modifier.fillMaxWidth().padding(bottom=12.dp))
 }
-@Composable private fun MockNotice() { if(BuildConfig.MOCK_PAYMENTS_ENABLED) SharedNote("TEST / MOCK PAYMENT\nNo real money moves.") }
 @Composable private fun RenterStatus(value:String) {
     val normalized=value.uppercase();val color=when {
         normalized.contains("FAILED") || normalized.contains("REJECTED") -> androidx.compose.ui.graphics.Color(0xFFB24D45)
@@ -503,33 +917,41 @@ internal fun allowedPaystackCheckoutUrl(value:String):Boolean=runCatching {
     u.scheme.equals("https",ignoreCase=true) && u.host.equals("checkout.paystack.com",ignoreCase=true) && u.userInfo==null && u.port in listOf(-1,443) &&
         u.rawPath?.matches(Regex("/[A-Za-z0-9-]+"))==true && u.rawFragment==null
 }.getOrDefault(false)
-@Composable private fun RemoteHomePhoto(url:String) {
-    var bitmap by remember(url) { mutableStateOf<android.graphics.Bitmap?>(null) }
+/** Listing photos already shown this session, kept in memory only (about an eighth of the app's memory) so scrolling back is instant. */
+private val photoCache=object:android.util.LruCache<String,android.graphics.Bitmap>((Runtime.getRuntime().maxMemory()/8L).toInt().coerceAtLeast(4*1024*1024)) {
+    override fun sizeOf(key:String,value:android.graphics.Bitmap)=value.byteCount
+}
+/** A signed link changes on every request, so the picture is remembered by its address without the signature. */
+private fun photoKey(url:String)=url.substringBefore('?')
+@Composable internal fun RemoteHomePhoto(url:String, modifier:Modifier = Modifier.fillMaxWidth().height(210.dp).clip(RoundedCornerShape(14.dp))) {
+    val context=LocalContext.current.applicationContext
+    var bitmap by remember(url) { mutableStateOf<android.graphics.Bitmap?>(PhotoCache.peek(url)) }
     var failed by remember(url) { mutableStateOf(false) }
     LaunchedEffect(url) {
-        try { bitmap=withContext(Dispatchers.IO) {
-            require(allowedHomeMedia(url))
-            photoClient.newCall(Request.Builder().url(url).build()).execute().use { response->
-                check(response.isSuccessful)
-                val bytes=requireNotNull(response.body).byteStream().use { input->
-                    val out=java.io.ByteArrayOutputStream();val chunk=ByteArray(8192)
-                    while(true) { val n=input.read(chunk);if(n<0) break;require(out.size()+n<=2_097_152);out.write(chunk,0,n) }
-                    out.toByteArray()
-                }
-                val bounds=BitmapFactory.Options().apply { inJustDecodeBounds=true };BitmapFactory.decodeByteArray(bytes,0,bytes.size,bounds)
-                require(validVerificationImageDimensions(bounds.outWidth,bounds.outHeight))
-                var sample=1;while(maxOf(bounds.outWidth,bounds.outHeight)/sample>700) sample*=2
-                BitmapFactory.decodeByteArray(bytes,0,bytes.size,BitmapFactory.Options().apply { inSampleSize=sample })
-            }
-        } } catch(e:CancellationException) { throw e } catch(_:Exception) { failed=true }
+        if(bitmap!=null) return@LaunchedEffect
+        // Memory, then disk, then network; large photos are shrunk while decoding instead of failing at 2 MB.
+        try { bitmap=PhotoCache.load(context,url); if(bitmap==null) failed=true }
+        catch(e:CancellationException) { throw e } catch(_:Exception) { failed=true }
     }
-    bitmap?.let { Image(it.asImageBitmap(),contentDescription="Listing photo",contentScale=ContentScale.Crop,modifier=Modifier.fillMaxWidth().height(210.dp).clip(RoundedCornerShape(14.dp))) }
+    bitmap?.let { Image(it.asImageBitmap(),contentDescription="Listing photo",contentScale=ContentScale.Crop,modifier=modifier) }
     if(failed) SharedText("Photo unavailable",true)
 }
 @Composable private fun ProtectedVideo(url:String) {
     if(!allowedHomeMedia(url)) { SharedText("Video unavailable",true);return }
     val context=LocalContext.current
-    val player=remember(url) { VideoView(context).apply { setVideoURI(Uri.parse(url));setMediaController(MediaController(context).also { it.setAnchorView(this) }) } }
+    var problem by remember(url) { mutableStateOf<String?>(null) }
+    val player=remember(url) { VideoView(context).apply {
+        setMediaController(MediaController(context).also { it.setAnchorView(this) })
+        setOnPreparedListener { it.start() }
+        setOnErrorListener { _,what,extra -> problem="This video could not be played here (code $what/$extra)."; true }
+        setVideoURI(Uri.parse(url))
+    } }
     DisposableEffect(player) { onDispose { player.stopPlayback() } }
     AndroidView(factory={player},modifier=Modifier.fillMaxWidth().height(230.dp))
+    problem?.let {
+        SharedText(it,true)
+        SharedLink("Open in video player",true) {
+            runCatching { context.startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(Uri.parse(url),"video/*")) }
+        }
+    }
 }

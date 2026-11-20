@@ -9,7 +9,7 @@ import java.time.LocalDate
 import java.util.concurrent.TimeUnit
 data class RenterHome(val id:String,val source:String,val title:String,val description:String,val propertyType:String,
     val monthlyRentKes:Long,val bedroomCount:Int?,val bathroomCount:Int,val furnished:Boolean,val availableFrom:String?,
-    val areaLabel:String,val approximateLatitude:BigDecimal,val approximateLongitude:BigDecimal,val approximateRadiusMeters:Int)
+    val areaLabel:String,val approximateLatitude:BigDecimal,val approximateLongitude:BigDecimal,val approximateRadiusMeters:Int,val sponsored:Boolean=false,val bookedByYou:Boolean=false)
 class HomePage(val items:List<RenterHome>,val page:Int,val hasNext:Boolean)
 class HomeMedia(val id:String,val mediaType:String,val contentType:String,val sortOrder:Int,val signedReadUrl:String)
 class UnlockPrice(val paymentType:String,val amountMinor:Long,val currency:String)
@@ -19,7 +19,8 @@ enum class MockPaymentResult { SUCCESS, FAILED }
 class RenterBooking(val id:String,val listingId:String,val listingKind:String,val sourceApplicationId:String,
     val rentAmountMinor:Long,val depositAmountMinor:Long,val commissionAmountMinor:Long,val totalAmountMinor:Long,
     val currency:String,val status:String,val moveInConfirmedAt:String?,val releaseEligibleAt:String?,val releasedAt:String?,
-    val renterAgreedAt:String?,val ownerAgreedAt:String?)
+    val renterAgreedAt:String?,val ownerAgreedAt:String?,
+    val ownerMoveInConfirmedAt:String?=null,val moveInAccepted:Boolean?=null,val moveInAnsweredAt:String?=null,val testPayoutStatus:String?=null)
 enum class RenterEvidence(val title:String) { ID_FRONT("National ID front"),ID_BACK("National ID back"),SELFIE("Live photo") }
 internal fun renterEvidenceReady(type:RenterEvidence,docs:List<OwnerVerificationDocument>) =
     docs.any { it.documentType==type.name && it.status=="READY" && it.securityChecked }
@@ -40,16 +41,26 @@ data class HomeFilter(val area:String="",val min:String="",val max:String="",val
     companion object { val PROPERTY_TYPES=setOf("APARTMENT","HOUSE","STUDIO","BEDSITTER","ROOM","SPARE_ROOM","SERVANT_QUARTER") }
 }
 data class RenterApplication(val source:String,val value:OwnerApplication)
-data class RenterThread(val id:String,val source:String,val unlocked:Boolean=true,val status:String="OPEN")
-class RenterRepository(private val auth:AuthRepository) {
+/** The renter's own view of an application: ARCHIVED or DELETED. Absent means it sits in the main list. */
+data class ApplicationStateItem(val kind:String,val applicationId:String,val state:String)
+data class RenterThread(val id:String,val source:String,val unlocked:Boolean=true,val status:String="OPEN",
+    val name:String?=null,val avatar:String?=null,val lastMessage:String?=null,val lastMessageAt:String?=null,val applicationId:String?=null)
+class RenterRepository(private val auth:AuthRepository, private val offlineHomes:OfflineHomes? = null) {
+    suspend fun listingAmenities(home:RenterHome)=auth.authorized("RENTER") { a,h -> a.renterListingAmenities(h,home.source.lowercase(),home.id) }
+
+    suspend fun applicationRemark(value:RenterApplication)=auth.authorized("RENTER") { a,h ->
+        a.renterApplicationRemark(h,if(value.source=="LANDLORD") "applications" else "sublessor-applications",value.value.id).remark
+    }
     suspend fun verification()=auth.authorized("RENTER") { a,h->a.renterVerification(h) }
     suspend fun documents()=auth.authorized("RENTER") { a,h->a.renterDocuments(h) }
     suspend fun ticket(type:RenterEvidence,replace:Boolean)=auth.authorized("RENTER") { a,h->a.renterTicket(h,VerificationUploadRequest(type.name,"image/jpeg",replace)) }
     suspend fun confirm(id:String)=auth.authorized("RENTER") { a,h->a.renterConfirm(h,id).check() }
     suspend fun submit()=auth.authorized("RENTER") { a,h->a.renterSubmit(h) }
     suspend fun homes(f:HomeFilter,page:Int=0,saved:Boolean=false)=auth.authorized("RENTER") { a,h->
-        require(f.error()==null); a.homes(h,page,f.area.trim().ifBlank { null },f.min.toLongOrNull(),f.max.toLongOrNull(),f.source,f.bedrooms.toIntOrNull(),f.furnished,f.propertyType,f.availableBy.ifBlank { null },saved) }
+        require(f.error()==null); a.homes(h,page,f.area.trim().ifBlank { null },f.min.toLongOrNull(),f.max.toLongOrNull(),f.source,f.bedrooms.toIntOrNull(),f.furnished,f.propertyType,f.availableBy.ifBlank { null },saved).also { if (page == 0 && !saved && f == HomeFilter()) try { offlineHomes?.save(it.items) } catch (_: Exception) { /* Browsing does not depend on cache storage. */ } } }
     suspend fun home(v:RenterHome)=auth.authorized("RENTER") { a,h->a.home(h,v.source,v.id) }
+    suspend fun homeById(source:String,id:String)=auth.authorized("RENTER") { a,h->a.home(h,source,id) }
+    suspend fun coverUrl(source:String,id:String):String?=auth.authorized("RENTER") { a,h->a.homePhotos(h,source,id) }.firstOrNull()?.signedReadUrl
     suspend fun photos(v:RenterHome)=auth.authorized("RENTER") { a,h->a.homePhotos(h,v.source,v.id) }
     suspend fun save(v:RenterHome,remove:Boolean)=auth.authorized("RENTER") { a,h->if(remove) a.removeHome(h,v.source,v.id).check() else a.saveHome(h,v.source,v.id).check() }
     suspend fun price(type:String)=auth.authorized("RENTER") { a,h->require(type in UNLOCKS); a.unlockPrice(h,type) }
@@ -64,20 +75,25 @@ class RenterRepository(private val auth:AuthRepository) {
     suspend fun phone(id:String)=auth.authorized("RENTER") { a,h->a.unlockedPhone(h,id) }
     suspend fun videos(id:String)=auth.authorized("RENTER") { a,h->a.unlockedVideos(h,id) }
     suspend fun applications()=auth.authorized("RENTER") { a,h->a.renterApplications(h).map { RenterApplication("LANDLORD",it) }+a.renterSharedApplications(h).map { RenterApplication("SUBLESSOR",it) } }
-    suspend fun apply(v:RenterHome)=auth.authorized("RENTER") { a,h->RenterApplication(v.source,a.renterApply(h,kind(v.source),v.id)) }
+    suspend fun apply(v:RenterHome,moveInDate:String,message:String?)=auth.authorized("RENTER") { a,h->RenterApplication(v.source,a.renterApply(h,kind(v.source),v.id,ApplyBody(moveInDate,message))) }
     suspend fun withdraw(v:RenterApplication)=auth.authorized("RENTER") { a,h->a.renterWithdraw(h,kind(v.source),v.value.id) }
     suspend fun book(v:RenterApplication)=auth.authorized("RENTER") { a,h->a.renterBook(h,if(v.source=="LANDLORD") "landlord-applications" else "sublessor-applications",v.value.id) }
     suspend fun booking(id:String)=auth.authorized("RENTER") { a,h->a.renterBooking(h,id) }
+    suspend fun answerMoveIn(id:String,accepted:Boolean,key:String)=auth.authorized("RENTER") { a,h->a.renterMoveInResponse(h,id,key,MoveInAnswer(accepted)) }
     suspend fun moveIn(id:String)=auth.authorized("RENTER") { a,h->a.renterMoveIn(h,id) }
     suspend fun agree(id:String)=auth.authorized("RENTER") { a,h->a.renterAgreement(h,id) }
     suspend fun history(page:Int)=auth.authorized("RENTER") { a,h->a.ownerPayments(h,page) }
+    suspend fun applicationStates()=auth.authorized("RENTER") { a,h->a.applicationStates(h) }
+    suspend fun setApplicationState(source:String,id:String,state:String)=auth.authorized("RENTER") { a,h->a.setApplicationState(h,source,id,ChatStateBody(state)).check() }
+    suspend fun chatStates()=auth.authorized("RENTER") { a,h->a.chatStates(h,"renter") }
+    suspend fun setChatState(kind:String,id:String,state:String)=auth.authorized("RENTER") { a,h->a.setChatState(h,"renter",kind,id,ChatStateBody(state)).check() }
     suspend fun rentalThreads(page:Int)=auth.authorized("RENTER") { a,h->a.renterThreads(h,page) }
     suspend fun roomThreads(page:Int)=auth.authorized("RENTER") { a,h->a.renterRoomThreads(h,page) }
     suspend fun messages(t:RenterThread,cursor:String?)=auth.authorized("RENTER") { a,h->
         if(t.source=="LANDLORD") a.renterMessages(h,t.id,cursor)
         else a.renterRoomMessages(h,t.id,cursor).let { OwnerMessagePage(it.items,it.nextCursor,it.hasMore) } }
-    suspend fun socket(source:String,events:(ChatEvent)->Unit)=auth.authorized("RENTER") { _,h->
-        RentalChatSocket(com.makaohub.android.BuildConfig.API_BASE_URL,h,if(source=="LANDLORD") ChatChannel.RENTAL else ChatChannel.ROOMMATE,events).also { it.connect() } }
+    suspend fun liveSocket(channel:ChatChannel,events:(ChatEvent)->Unit):RentalChatSocket=auth.authorizedForSocket("RENTER") { h->
+        RentalChatSocket(com.makaohub.android.BuildConfig.API_BASE_URL,h,channel,events).also { it.connect() } }
     suspend fun report(v:RenterHome,category:String,description:String)=auth.authorized("RENTER") { a,h->
         require(category in REPORT_CATEGORIES && description.isNotBlank() && description.length<=1000)
         a.report(h,ReportRequest(if(v.source=="LANDLORD") "LANDLORD_LISTING" else "SHARED_LISTING",v.id,category,description.trim()))

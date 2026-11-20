@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Colours sampled from drawable-nodpi/makao_splash_screen.png: dusk sky, sunset glow, dark lawn. -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+    <gradient
+        android:angle="270"
+        android:startColor="#606769"
+        android:centerColor="#B4854B"
+        android:endColor="#21251F" />
+</shape>

@@ -10,6 +10,9 @@ import okhttp3.HttpUrl.Companion.toHttpUrl
 import java.math.BigDecimal
 import java.util.concurrent.TimeUnit
 
+data class AmenityOption(val id:String,val name:String)
+class AmenitySelection(val ids:Set<String>)
+
 data class LandlordSummary(val totalListings: Long, val draftListings: Long, val publishedListings: Long)
 data class OwnerListing(val id: String, val title: String, val description: String, val propertyType: String,
     val monthlyRentKes: Long, val bedroomCount: Int, val bathroomCount: Int, val furnished: Boolean,
@@ -34,12 +37,20 @@ data class OwnerMedia(val id: String, val listingId: String, val mediaType: Stri
 class MediaUploadRequest(val mediaType: String, val contentType: String, val sizeBytes: Long, val sortOrder: Int)
 class MediaUploadTicket(val mediaId: String, val mediaType: String, val contentType: String,
     val sizeBytes: Long, val sortOrder: Int, val uploadUrl: String)
-data class OwnerApplication(val id: String, val listingId: String, val status: String, val createdAt: String, val updatedAt: String, val rejectionReason: String? = null)
+data class OwnerApplication(val id: String, val listingId: String, val status: String, val createdAt: String, val updatedAt: String, val rejectionReason: String? = null,
+    val renterName: String? = null, val renterAvatarUrl: String? = null, val renterVerificationStatus: String? = null,
+    val moveInDate: String? = null, val message: String? = null)
+class ApplyBody(val moveInDate: String, val message: String? = null)
+data class ApplicationNote(val applicationId: String, val hidden: Boolean, val remark: String?)
+class ApplicationHidden(val hidden: Boolean)
+class ApplicationRemark(val remark: String)
+class ApplicationRemarkResponse(val remark: String?)
 data class OwnerPage<T>(val items: List<T>, val page: Int, val size: Int, val totalElements: Long, val totalPages: Int, val hasNext: Boolean)
 data class OwnerThread(val id: String, val rentalApplicationId: String, val status: String,
-    val createdAt: String, val updatedAt: String, val closedAt: String?)
+    val createdAt: String, val updatedAt: String, val closedAt: String?, val counterpartyName:String?=null,
+    val counterpartyAvatarUrl:String?=null, val lastMessage:String?=null, val lastMessageAt:String?=null)
 data class OwnerMessage(val id: String, val threadId: String, val senderId: String,
-    val clientMessageId: String, val content: String, val contactMasked: Boolean, val createdAt: String)
+    val clientMessageId: String, val content: String, val contactMasked: Boolean, val createdAt: String, val deliveredAt: String? = null)
 data class OwnerMessagePage(val items: List<OwnerMessage>, val nextCursor: String?, val hasNext: Boolean)
 class OwnerPayment(val id: String, val paymentType: String, val targetKind: String, val listingId: String?,
     val bookingId: String?, val amountMinor: Long, val currency: String, val status: String,
@@ -88,6 +99,29 @@ private fun signedStorageRequest(uploadUrl: String, body: RequestBody): Request 
 
 /** Every owner call shares the existing JWT/refresh lock. No landlord ID comes from the UI. */
 class LandlordRepository(private val auth: AuthRepository) {
+    suspend fun amenities() = auth.authorized("LANDLORD") { a,h -> a.amenities(h) }
+    suspend fun selectedAmenities(id:String) = auth.authorized("LANDLORD") { a,h -> a.listingAmenities(h,"landlord",id) }
+    suspend fun saveAmenities(id:String,ids:Set<String>) = auth.authorized("LANDLORD") { a,h -> a.saveListingAmenities(h,"landlord",id,AmenitySelection(ids)) }
+
+    suspend fun notes() = auth.authorized("LANDLORD") { api,h -> api.applicationNotes(h,"landlord") }
+    suspend fun hide(id:String, hidden:Boolean) = auth.authorized("LANDLORD") { api,h -> api.hideApplication(h,"landlord",id,ApplicationHidden(hidden)).let { if (!it.isSuccessful) throw retrofit2.HttpException(it) } }
+    suspend fun remark(id:String, value:String) = auth.authorized("LANDLORD") { api,h -> api.remarkApplication(h,"landlord",id,ApplicationRemark(value)).let { if (!it.isSuccessful) throw retrofit2.HttpException(it) } }
+    suspend fun conversation(id:String) = auth.authorized("LANDLORD") { api,h -> api.landlordApplicationConversation(h,id) }
+    suspend fun cardMetrics() = auth.authorized("LANDLORD") { api, h -> api.landlordCardMetrics(h) }
+    suspend fun offers() = auth.authorized("LANDLORD") { api, h -> api.landlordOffers(h) }
+    suspend fun offerCheckout(code: String, listingId: String, key: String) = auth.authorized("LANDLORD") { api, h ->
+        api.landlordOfferCheckout(h, key, LandlordOfferPurchase(code, listingId))
+    }
+    suspend fun bookings() = auth.authorized("LANDLORD") { api, h -> api.ownerBookings(h, "landlord") }
+    suspend fun confirmBookingTerms(id: String) = auth.authorized("LANDLORD") { api, h -> api.ownerConfirmTerms(h, "landlord", id) }
+    suspend fun confirmBookingMoveIn(id: String, key: String) = auth.authorized("LANDLORD") { api, h -> api.ownerConfirmMoveIn(h, "landlord", id, key) }
+    suspend fun planCheckout(code: String, key: String) = auth.authorized("LANDLORD") { api, h ->
+        api.landlordOfferCheckout(h, key, LandlordOfferPurchase(code, null))
+    }
+    suspend fun redeemIncludedBoost(listingId: String) = auth.authorized("LANDLORD") { api, h ->
+        api.landlordRedeemBoost(h, BoostRedeemBody(listingId))
+    }
+    suspend fun reconcileOffer(reference: String) = auth.authorized("LANDLORD") { api, h -> api.reconcilePaystack(h, PaystackReconcileBody(reference)) }
     suspend fun verification() = auth.authorized("LANDLORD") { api, h -> api.landlordVerification(h) }
     suspend fun verificationDocuments() = auth.authorized("LANDLORD") { api, h -> api.landlordVerificationDocuments(h) }
     suspend fun verificationTicket(type: OwnerEvidence, replaceExisting: Boolean = false) = auth.authorized("LANDLORD") { api, h ->
@@ -114,7 +148,7 @@ class LandlordRepository(private val auth: AuthRepository) {
     }
     suspend fun transition(id: String, action: String) = auth.authorized("LANDLORD") { api, h ->
         when (action) { "publish" -> api.publishListing(h, id); "pause" -> api.pauseListing(h, id)
-            "resume" -> api.resumeListing(h, id); else -> error("Unsupported listing action") }
+            "resume" -> api.resumeListing(h, id); "archive" -> api.archiveListing(h, id); else -> error("Unsupported listing action") }
     }
     suspend fun review(id: String) = auth.authorized("LANDLORD") { api, h -> api.landlordListingReview(h, id) }
     suspend fun submitReview(id: String) = auth.authorized("LANDLORD") { api, h ->
@@ -130,6 +164,7 @@ class LandlordRepository(private val auth: AuthRepository) {
     suspend fun location(id: String) = auth.authorized("LANDLORD") { api, h -> api.ownerLocation(h, id) }
     suspend fun saveLocation(id: String, location: OwnerLocation) = auth.authorized("LANDLORD") { api, h -> api.saveLocation(h, id, location) }
     suspend fun media(id: String) = auth.authorized("LANDLORD") { api, h -> api.ownerMedia(h, id) }
+    suspend fun cover(id: String) = auth.authorized("LANDLORD") { api, h -> api.ownerPhotos(h, id).firstOrNull() }
     suspend fun uploadTicket(id: String, request: MediaUploadRequest) = auth.authorized("LANDLORD") { api, h -> api.mediaUpload(h, id, request) }
     suspend fun confirm(id: String, media: String) = auth.authorized("LANDLORD") { api, h -> api.confirmMedia(h, id, media) }
     suspend fun remove(id: String, media: String) = auth.authorized("LANDLORD") { api, h ->
@@ -141,14 +176,22 @@ class LandlordRepository(private val auth: AuthRepository) {
         when(action) { "review" -> api.reviewApplication(h, id); "approve" -> api.approveApplication(h, id)
             "reject" -> api.rejectApplication(h, id, OwnerApplicationRejection(requireNotNull(reason))); else -> error("Unsupported application action") }
     }
+    suspend fun chatStates() = auth.authorized("LANDLORD") { api, h -> api.chatStates(h, "landlord") }
+    suspend fun setChatState(kind: String, id: String, state: String) = auth.authorized("LANDLORD") { api, h ->
+        val reply = api.setChatState(h, "landlord", kind, id, ChatStateBody(state))
+        if (!reply.isSuccessful) throw retrofit2.HttpException(reply)
+    }
     suspend fun threads(page: Int = 0) = auth.authorized("LANDLORD") { api, h -> api.landlordThreads(h, page) }
     suspend fun messages(id: String, cursor: String? = null) = auth.authorized("LANDLORD") { api, h -> api.landlordMessages(h, id, cursor) }
     suspend fun payments(page: Int = 0) = auth.authorized("LANDLORD") { api, h -> api.ownerPayments(h, page) }
     suspend fun checkout(type: String, listingId: String?, key: String) = auth.authorized("LANDLORD") { api, h -> api.ownerCheckout(h, key, OwnerCheckout(type, listingId)) }
     suspend fun complete(reference: String, outcome: String) = auth.authorized("LANDLORD") { api, h -> api.completeOwnerMock(h, MockCompletion(reference, outcome)) }
+    suspend fun testDestination() = auth.authorized("LANDLORD") { api, h -> api.landlordTestDestination(h) }
+    suspend fun configureTestDestination(phone: String, key: String) = auth.authorized("LANDLORD") { api, h ->
+        api.landlordConfigureTestDestination(h, key, OwnerTestDestinationRequest(phone))
+    }
     suspend fun connectChat(baseUrl: String, events: (ChatEvent) -> Unit): RentalChatSocket {
-        auth.profile() // Refresh an expired access token before authenticating the socket.
-        return auth.authorized("LANDLORD") { _, h -> RentalChatSocket(baseUrl, h, events = events).also { it.connect() } }
+        return auth.authorizedForSocket("LANDLORD") { h -> RentalChatSocket(baseUrl, h, events = events).also { it.connect() } }
     }
 
     /** Separate client: Makao JWTs are never attached to signed Supabase upload requests. */

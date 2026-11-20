@@ -27,6 +27,9 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.delay
+import androidx.lifecycle.repeatOnLifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
@@ -47,7 +50,7 @@ import java.util.Locale
     })
     val context = LocalContext.current
     val window = remember(context) { generateSequence(context) { (it as? ContextWrapper)?.baseContext }.filterIsInstance<Activity>().firstOrNull()?.window }
-    val sensitive = model.screen in listOf(SharedScreen.VERIFICATION, SharedScreen.LOCATION)
+    val sensitive = BLOCK_SCREEN_CAPTURE && model.screen in listOf(SharedScreen.VERIFICATION, SharedScreen.LOCATION)
     DisposableEffect(window, sensitive) {
         if (sensitive) window?.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
         onDispose { if (sensitive) window?.clearFlags(WindowManager.LayoutParams.FLAG_SECURE) }
@@ -62,12 +65,21 @@ import java.util.Locale
         onDispose { lifecycle.lifecycle.removeObserver(observer); model.clear() }
     }
     LaunchedEffect(model) { model.start() }
+    LaunchedEffect(model, lifecycle, model.verification?.status) {
+        if (model.verification?.status == "PENDING") lifecycle.lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
+            while (isActive) {
+                model.refreshReviewStatus()
+                delay(15_000L) // Foreground-only status reads; no push channel.
+            }
+        }
+    }
     val back = { model.go(when (model.screen) {
         SharedScreen.MEDIA -> SharedScreen.DETAILS
         SharedScreen.LOCATION -> SharedScreen.MEDIA
         SharedScreen.PREVIEW -> SharedScreen.LOCATION
         SharedScreen.APPLICATION -> SharedScreen.APPLICATIONS
         SharedScreen.CHAT -> SharedScreen.INBOX
+        SharedScreen.PLANS -> SharedScreen.PROFILE
         SharedScreen.RENTER_PROFILE -> SharedScreen.DISCOVERY
         SharedScreen.DISCOVERY -> SharedScreen.PREFERENCE_SUMMARY
         else -> SharedScreen.HOME
@@ -90,22 +102,43 @@ import java.util.Locale
     val snackbar = remember { SnackbarHostState() }
     LaunchedEffect(model.notice) { model.notice?.let { snackbar.showSnackbar(it); model.dismissNotice() } }
     val editor = model.screen in listOf(SharedScreen.DETAILS, SharedScreen.MEDIA, SharedScreen.LOCATION, SharedScreen.PREVIEW)
-    Scaffold(containerColor = Cream, snackbarHost = { SnackbarHost(snackbar) }, bottomBar = {
-        if (!editor) NavigationBar(containerColor = Color.White) {
+    Scaffold(containerColor = if (model.screen in listOf(SharedScreen.HOME, SharedScreen.LISTINGS, SharedScreen.PROFILE, SharedScreen.INBOX, SharedScreen.APPLICATIONS)) DashboardBackground else Cream, snackbarHost = { SnackbarHost(snackbar) }, bottomBar = {
+        if (!editor) Box(Modifier.navigationBarsPadding().padding(horizontal = 24.dp).padding(bottom = 16.dp, top = 8.dp)) {
+        Surface(color = Color.White, shape = RoundedCornerShape(18.dp)) { FixedFontScale { NavigationBar(containerColor = Color.White, tonalElevation = 0.dp) {
             listOf(Triple(SharedScreen.HOME, "Home", Icons.Outlined.Home), Triple(SharedScreen.LISTINGS, "Listings", Icons.Outlined.Apartment),
                 Triple(SharedScreen.APPLICATIONS, "Applications", Icons.Outlined.Description), Triple(SharedScreen.INBOX, "Messages", Icons.Outlined.ChatBubbleOutline),
                 Triple(SharedScreen.PROFILE, "Profile", Icons.Outlined.PersonOutline)).forEach { (target, label, icon) ->
-                NavigationBarItem(selected = model.screen == target, onClick = { model.go(target) }, enabled = !model.busy,
-                    icon = { Icon(icon, null, Modifier.size(21.dp)) }, label = { Text(label, fontSize = 10.sp) })
+                val selected = when (target) {
+                    SharedScreen.HOME -> model.screen == SharedScreen.HOME
+                    SharedScreen.LISTINGS -> model.screen in listOf(SharedScreen.LISTINGS, SharedScreen.STATES)
+                    SharedScreen.APPLICATIONS -> model.screen in listOf(SharedScreen.APPLICATIONS, SharedScreen.APPLICATION)
+                    SharedScreen.INBOX -> model.screen in listOf(SharedScreen.INBOX, SharedScreen.CHAT)
+                    SharedScreen.PROFILE -> model.screen in listOf(SharedScreen.PROFILE, SharedScreen.PAYMENTS, SharedScreen.PLANS)
+                    else -> false
+                }
+                NavigationBarItem(selected = selected, onClick = { model.go(target) }, enabled = !model.busy,
+                    colors = NavigationBarItemDefaults.colors(indicatorColor = Color.Transparent, selectedIconColor = Brown, selectedTextColor = Brown, unselectedIconColor = Muted, unselectedTextColor = Muted),
+                    icon = { BadgedTabIcon(icon, when (target) { SharedScreen.APPLICATIONS -> ApplicationSeen.unseen(androidx.compose.ui.platform.LocalContext.current, model.applications.map { "${it.id}:${it.status}" })
+                        SharedScreen.INBOX -> ChatSeen.unread(androidx.compose.ui.platform.LocalContext.current, model.inboxThreads.map { it.id to it.lastMessageAt })
+                        else -> 0 }, LocalContentColor.current) }, label = { NavLabel(label) })
             }
-        }
+        } } } }
     }) { insets ->
         val scroll = rememberScrollState()
         LaunchedEffect(model.screen) { scroll.scrollTo(0) }
+        LaunchedEffect(model) { while (true) { model.refreshBadges(); kotlinx.coroutines.delay(8_000) } }
+        val seenContext = androidx.compose.ui.platform.LocalContext.current
+        LaunchedEffect(model.screen, model.applications) {
+            if (model.screen in listOf(SharedScreen.APPLICATIONS, SharedScreen.APPLICATION))
+                ApplicationSeen.markSeen(seenContext, model.applications.map { "${it.id}:${it.status}" })
+        }
         Column(Modifier.fillMaxSize().padding(insets).statusBarsPadding().imePadding().verticalScroll(scroll).padding(horizontal = 22.dp).padding(bottom = 24.dp)) {
-            Row(Modifier.height(52.dp), verticalAlignment = Alignment.CenterVertically) {
+            Row(Modifier.fillMaxWidth().height(52.dp), verticalAlignment = Alignment.CenterVertically) {
                 IconButton(back, enabled = !model.busy, modifier = Modifier.size(28.dp)) { Icon(Icons.AutoMirrored.Outlined.ArrowBack, "Back", tint = Brown, modifier = Modifier.size(18.dp)) }
                 Spacer(Modifier.width(6.dp)); Text("makao hub", color = Brown, fontSize = 15.sp, fontWeight = FontWeight.Bold)
+                Spacer(Modifier.weight(1f))
+                IconButton({ model.go(SharedScreen.PAYMENTS) }, enabled = !model.busy, modifier = Modifier.size(34.dp)) { Icon(Icons.Outlined.Payments, "Payments", tint = Brown, modifier = Modifier.size(21.dp)) }
+                Spacer(Modifier.width(56.dp))
             }
             if (model.busy) { LinearProgressIndicator(Modifier.fillMaxWidth()); Gap(10) }
             when (model.screen) {
@@ -126,12 +159,20 @@ import java.util.Locale
                 SharedScreen.INBOX -> SharedInbox(model)
                 SharedScreen.CHAT -> SharedConversation(model, profile)
                 SharedScreen.PAYMENTS -> SharedPayments(model)
+                SharedScreen.PLANS -> PlansPanel(model::boostOffers, model::planCheckout, model::reconcileBoost,
+                    model.listings.filter { it.status == "PUBLISHED" }.map { it.id to it.title },
+                    model::redeemIncludedBoost) { model.go(SharedScreen.PLANS) }
                 SharedScreen.PROFILE -> {
-                    SharedHeading("Your profile", "Sublessor")
-                    SharedCard { SharedText(profile.fullName); SharedText(profile.email, true); SharedStatus(model.verification?.status ?: "NOT_STARTED")
-                        SharedLink("Verification", !model.busy) { model.go(SharedScreen.VERIFICATION) } }
-                    SharedCard { SharedLink("Payment history", !model.busy) { model.go(SharedScreen.PAYMENTS) } }
-                    TextButton({ model.clear(); auth.logout() }, enabled = !model.busy) { Text("Sign out") }
+                    AccountProfile(profile, model.verification?.status ?: "NOT_STARTED", model.busy, auth,
+                        documents = model.documents,
+                        actions = listOf(
+                            ProfileAction("My listings", Icons.Outlined.Home) { model.go(SharedScreen.LISTINGS) },
+                            ProfileAction("Plans & boosts", Icons.Outlined.Bolt) { model.go(SharedScreen.PLANS) },
+                            ProfileAction("Boost a listing", Icons.Outlined.RocketLaunch) { model.go(SharedScreen.LISTINGS) },
+                            ProfileAction("Payment history & payouts", Icons.Outlined.Payments) { model.go(SharedScreen.PAYMENTS) }),
+                        onRefreshDocuments = model::refreshVerification,
+                        onVerification = { model.go(SharedScreen.VERIFICATION) },
+                        onLogout = { model.clear(); auth.logout() })
                 }
                 SharedScreen.VERIFICATION -> Unit
             }
@@ -140,29 +181,24 @@ import java.util.Locale
 }
 
 @Composable private fun SharedHome(model: SublessorViewModel, profile: MyProfile) {
-    SharedHeading("Good company starts here", "Karibu, ${profile.fullName.substringBefore(' ')}. A clear view of your shared home.")
-    SharedStatus(if (model.verification?.status == "VERIFIED") "Verified Sublessor" else model.verification?.status ?: "NOT_STARTED"); Gap(16)
-    if (model.verification?.status != "VERIFIED") {
-        SharedNote("Complete your ID, live photo and rental agreement verification.")
-        SharedButton("Verify as Sublessor", !model.busy) { model.go(SharedScreen.VERIFICATION) }; Gap(16)
-    }
-    SharedCard {
-        SharedText("Your shared spaces", true)
-        if (model.listings.isEmpty()) SharedText("No shared spaces yet.", true)
-        model.listings.take(5).forEach { listing -> SharedLink(listing.title, !model.busy) { model.edit(listing) }; SharedText("${listing.status.lowercase().replaceFirstChar { it.uppercase() }} · ${sharedKes(listing.monthlyRentKes)} / month", true) }
-    }
-    SharedButton("Create shared listing", !model.busy && model.verification?.status == "VERIFIED", model::newListing); Gap(18)
-    SharedCard {
-        SharedText("People and progress", true)
-        SharedLink("Roommate interests · View", !model.busy) { model.go(SharedScreen.INTERESTS) }
-        SharedText("${model.interests.size} interests", true)
-        SharedLink("Roommate preferences · Discover", !model.busy) { model.go(SharedScreen.PREFERENCE_SUMMARY) }
-        SharedLink("Applications · Review", !model.busy) { model.go(SharedScreen.APPLICATIONS) }
-        SharedText("${model.applications.count { it.status in listOf("SUBMITTED", "UNDER_REVIEW") }} waiting for review", true)
-        SharedLink("Messages · Open", !model.busy) { model.go(SharedScreen.INBOX) }
-        SharedLink("Test payments · View", !model.busy) { model.go(SharedScreen.PAYMENTS) }
-    }
-    SharedNote("Keep your verification current\nYour rental agreement stays private.")
+    val draft = model.unfinishedDraft
+    LaunchedEffect(model.listings) { model.refreshUnfinishedDraft() }
+    var asking by remember { mutableStateOf(false) }
+    LaunchedEffect(draft?.id) { if (draft != null && DraftPrompt.firstTime(draft.id)) asking = true }
+    if (asking && draft != null) DraftChoiceDialog(draft.title, model.busy,
+        { asking = false; model.edit(draft) }, { asking = false; model.newListing() }, { asking = false })
+    PartnerDashboard(role = "Sublessor", plansOffers = model::boostOffers, verification = model.verification?.status ?: profile.verificationStatus ?: "NOT_STARTED",
+        active = if (model.workspaceLoaded) model.listings.count { it.status == "PUBLISHED" } else null,
+        drafts = if (model.workspaceLoaded) model.listings.count { it.status == "DRAFT" } else null,
+        pending = if (model.workspaceLoaded) model.applications.count { it.status in listOf("SUBMITTED", "UNDER_REVIEW") } else null,
+        applications = model.applications, applicationsLoaded = model.workspaceLoaded, listingTitle = { id -> model.listings.firstOrNull { it.id == id }?.title }, busy = model.busy,
+        onPlans = { model.go(SharedScreen.PLANS) },
+        onCreate = { if (draft != null) asking = true else model.newListing() }, onApplications = { model.go(SharedScreen.APPLICATIONS) },
+        onBoost = { model.go(SharedScreen.LISTINGS) }, onApplication = model::openApplication,
+        onMessages = { model.go(SharedScreen.INBOX) }, onPayments = { model.go(SharedScreen.PAYMENTS) },
+        onVerify = { model.go(SharedScreen.VERIFICATION) })
+    SharedLink("Roommate interests", !model.busy) { model.go(SharedScreen.INTERESTS) }
+    SharedLink("Roommate preferences", !model.busy) { model.go(SharedScreen.PREFERENCE_SUMMARY) }
 }
 
 @Composable private fun SharedDetails(model: SublessorViewModel) {
@@ -184,16 +220,11 @@ import java.util.Locale
     SharedInput("People per room", model.form.peoplePerRoom, !model.busy, number = true) { model.form = model.form.copy(peoplePerRoom = it) }
     SharedInput("Household lifestyle", model.form.lifestyle, !model.busy, lines = 2) { model.form = model.form.copy(lifestyle = it) }
     SharedInput("Shared home description", model.form.description, !model.busy, lines = 3) { model.form = model.form.copy(description = it) }
-    SharedInput("Bathrooms", model.form.bathrooms, !model.busy, number = true) { model.form = model.form.copy(bathrooms = it) }
+    ListingCountDropdown("Bathrooms", model.form.bathrooms, 1..20, !model.busy) { model.form = model.form.copy(bathrooms = it) }
     SharedInput("Available from · YYYY-MM-DD", model.form.available, !model.busy) { model.form = model.form.copy(available = it) }
     Row(verticalAlignment = Alignment.CenterVertically) { Checkbox(model.form.furnished, { model.form = model.form.copy(furnished = it) }, enabled = !model.busy); SharedText("Furnished") }
-    listOf("WATER" to "Water", "WIFI" to "Wi-Fi", "SECURITY" to "Security", "PARKING" to "Parking", "PETS" to "Pets").chunked(2).forEach { group ->
-        Row { group.forEach { (key, label) -> Row(Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically) {
-            Checkbox(key in model.form.amenities, { checked -> model.form = model.form.copy(amenities = if (checked) model.form.amenities + key else model.form.amenities - key) }, enabled = !model.busy)
-            SharedText(label)
-        } } }
-    }
-    SharedNote("Shared space, not a whole unit\nChoose a spare room or servant quarter when seeking a roommate.")
+    Gap(10)
+    AmenitySelector(model.amenityOptions, model.selectedAmenityIds, !model.busy, model::toggleAmenity)
     SharedButton("Save and continue", !model.busy) { model.saveDraft(true) }
     TextButton({ model.saveDraft(false) }, enabled = !model.busy, modifier = Modifier.fillMaxWidth()) { Text("Save draft") }
 }
@@ -201,12 +232,35 @@ import java.util.Locale
 @Composable private fun SharedMedia(model: SublessorViewModel) {
     val resolver = LocalContext.current.contentResolver
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { if (it != null) model.uploadMedia(resolver, it) }
+    val queue = remember { mutableStateListOf<android.net.Uri>() }
+    val photoPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris -> queue.clear(); queue.addAll(uris) }
     var deleting by remember { mutableStateOf<OwnerMedia?>(null) }
-    SharedHeading("Show the shared space", "Step 2 of 4 · Bedroom and common areas")
+    MediaStepHeader(2, 4, "Show the shared space", "Bright, honest photos of the bedroom and common areas bring the right roommates.")
     LocalPhoto(model.media.firstNotNullOfOrNull { model.photos[it.id] })
-    SharedText("${model.media.count { it.mediaType == "IMAGE" }} photos · ${model.media.count { it.mediaType == "VIDEO" }} video", true); Gap(10)
-    SharedLink("Add photos", !model.busy && model.pendingMedia == null) { picker.launch(arrayOf("image/jpeg", "image/png", "image/webp")) }
-    if (model.media.none { it.mediaType == "VIDEO" }) SharedLink("Add video walkthrough", !model.busy && model.pendingMedia == null) { picker.launch(arrayOf("video/mp4")) }
+    Gap(4)
+    var photoLimit by remember { mutableIntStateOf(2) }
+    LaunchedEffect(Unit) {
+        try { val o = model.boostOffers(); photoLimit = if (o.activePhotoLimit < 0) Int.MAX_VALUE else o.activePhotoLimit }
+        catch (e: kotlinx.coroutines.CancellationException) { throw e }
+        catch (_: Exception) { }
+    }
+    val photoCount = model.media.count { it.mediaType == "IMAGE" }
+    if (photoCount >= photoLimit) {
+        SharedText("Your plan allows $photoLimit photos per listing. Upgrade your plan to add more.", true)
+        SharedLink("View plans", !model.busy) { model.go(SharedScreen.PLANS) }
+    }
+    // Photos chosen together upload one after another; stops on any failure so Retry still works.
+    LaunchedEffect(queue.size, model.busy, model.pendingMedia, photoCount) {
+        if (queue.isEmpty() || model.busy) return@LaunchedEffect
+        if (model.pendingMedia != null || photoCount >= photoLimit) { queue.clear(); return@LaunchedEffect }
+        model.uploadMedia(resolver, queue.removeAt(0))
+    }
+    if (queue.isNotEmpty()) { SharedText("Uploading photos… ${queue.size} more waiting", true) }
+    PhotoAddCard(photoCount, photoLimit, !model.busy && queue.isEmpty() && model.pendingMedia == null && photoCount < photoLimit) {
+        photoPicker.launch(arrayOf("image/jpeg", "image/png", "image/webp"))
+    }
+    if (model.media.none { it.mediaType == "VIDEO" }) VideoAddCard(false, false, !model.busy && model.pendingMedia == null, { picker.launch(arrayOf("video/mp4")) }, {})
+    if (photoCount == 0) PhotoTipsCard()
     model.media.forEach { value -> SharedCard {
         LocalPhoto(model.photos[value.id])
         SharedText(if (value.mediaType == "VIDEO") "Shared-home video tour" else "Selected photo")
@@ -225,11 +279,9 @@ import java.util.Locale
 @Composable private fun SharedLocation(model: SublessorViewModel) {
     var area by remember(model.selected?.id, model.location) { mutableStateOf(model.location?.areaLabel ?: "") }
     var pin by remember(model.selected?.id, model.location) { mutableStateOf(model.location?.let { LatLng(it.latitude.toDouble(), it.longitude.toDouble()) }) }
-    SharedHeading("Set your private home pin", "Step 3 of 4 · Your household address stays private")
-    SharedInput("Public approximate area", area, !model.busy) { area = it }
-    PropertyMapPicker(pin, !model.busy, showDeveloperDetails = false) { pin = it }
-    SharedNote("Not shown in roommate discovery\nOnly the approximate area is public. Exact access is controlled by the server.")
-    SharedButton("Save exact pin", !model.busy && pin != null) { pin?.let { model.savePin(area, it.latitude, it.longitude) } }
+    SharedHeading("Set your private home pin", "Step 3 of 4 · Pick your county, then find your address")
+    PropertyMapPicker(pin, !model.busy, initialCounty = area, onCounty = { area = it }) { pin = it }
+    SharedButton("Save exact pin", !model.busy && pin != null && area.isNotBlank()) { pin?.let { model.savePin(area, it.latitude, it.longitude) } }
     TextButton({ model.go(SharedScreen.LISTINGS) }, enabled = !model.busy, modifier = Modifier.fillMaxWidth()) { Text("Save draft") }
 }
 
@@ -262,20 +314,39 @@ import java.util.Locale
 }
 
 @Composable private fun SharedListings(model: SublessorViewModel) {
-    SharedHeading("Your shared spaces", "Manage your rooms and availability")
-    SharedButton("Create shared listing", !model.busy && model.verification?.status == "VERIFIED", model::newListing); Gap(16)
     var count by remember(model.listings) { mutableIntStateOf(20) }
-    model.listings.take(count).forEach { value -> SharedCard {
-        SharedText(value.title); SharedStatus(value.status); SharedText("${sharedKes(value.monthlyRentKes)} / month", true)
-        SharedLink(if (value.status == "DRAFT") "Continue draft" else "Manage listing", !model.busy) { model.edit(value) }
-    } }
-    if (model.listings.isEmpty()) SharedText("No shared listings yet.", true)
-    if (count < model.listings.size) SharedLink("Load more", true) { count += 20 }
+    var selected by remember { mutableStateOf("ALL") }
+    val activeListings = model.listings.filter { it.status != "ARCHIVED" }
+    val draft = model.unfinishedDraft
+    LaunchedEffect(model.listings) { model.refreshUnfinishedDraft() }
+    var asking by remember { mutableStateOf(false) }
+    if (asking && draft != null) DraftChoiceDialog(draft.title, model.busy,
+        { asking = false; model.edit(draft) }, { asking = false; model.newListing() }, { asking = false })
+    PartnerListingHeader("SUBLESSOR", selected, activeListings.groupingBy { it.status }.eachCount(), activeListings.size,
+        model.busy, { selected = it; count = 20 }, { if (draft != null) asking = true else model.newListing() })
+    val filtered = activeListings.filter { selected == "ALL" || it.status == selected }
+    filtered.take(count).forEach { value ->
+        val metrics = model.cardMetrics[value.id]
+        PartnerListingCard(value.id, value.title, value.status, value.monthlyRentKes,
+            "${value.bathroomCount} bath · ${value.spaceType.lowercase().replace('_', ' ')}",
+            value.availableFrom, metrics?.viewsToday, if (model.workspaceLoaded) model.applications.count { it.listingId == value.id } else null,
+            model.busy, model::listingCover, { model.viewListingApplications(value.id) }, { model.edit(value) },
+            { model.updateListing(value) }, { model.removeListing(value) }) {
+            ListingBoost(value.id, value.status == "PUBLISHED", metrics?.boostExpiresAt != null, model.busy,
+                model::boostOffers, model::buyBoost, model::reconcileBoost) { model.go(SharedScreen.LISTINGS) }
+        }
+    }
+    if (filtered.isEmpty()) SharedText(if (activeListings.isEmpty()) "No shared listings yet." else "No listings in this category.", true)
+    if (count < filtered.size) SharedLink("Load more", true) { count += 20 }
 }
 
 @Composable private fun SharedStates(model: SublessorViewModel) {
     val listing = model.selected ?: return
     SharedHeading("Shared-listing alternatives", "Manage, publish and media states")
+    if (model.verification?.status != "VERIFIED") {
+        SharedNote("Verification required\nComplete Sublessor verification before publishing.")
+        SharedLink("Open verification", !model.busy) { model.go(SharedScreen.VERIFICATION) }
+    }
     SharedCard {
         SharedText(listing.title); SharedStatus(listing.status)
         if (listing.status == "PUBLISHED") SharedButton("Pause shared listing", !model.busy) { model.transition("pause") }
@@ -290,39 +361,49 @@ import java.util.Locale
                 } else {
                     SharedNote("Under staff review\nPublication remains locked until a moderator records a decision.")
                     SharedLink("Refresh review status", !model.busy) { model.go(SharedScreen.STATES) }
+                    SharedLink("Back to dashboard", !model.busy) { model.go(SharedScreen.HOME) }
                 }
                 "REJECTED" -> {
                     SharedNote("Changes required\n${review.moderationReason ?: "Open the listing and correct the submitted details."}")
                     SharedButton("Revise shared listing", !model.busy, model::reviseListingReview)
                 }
                 "APPROVED" -> {
-                    SharedNote("Approved\nThe current saved version may be published.")
+                    SharedNote(if (listing.status == "PUBLISHED") "Approved\nYour listing is published." else "Approved\nManage publication below.")
                     if (listing.status == "DRAFT") SharedButton("Publish shared listing", !model.busy) { model.transition("publish") }
                     if (listing.status == "PAUSED") SharedButton("Resume shared listing", !model.busy) { model.transition("resume") }
                 }
             }
         }
     }
+    SharedLink("Back to listings", !model.busy) { model.go(SharedScreen.LISTINGS) }
 }
 
 @Composable private fun SharedApplications(model: SublessorViewModel) {
-    SharedHeading("Shared-home applications", "People interested in your shared home")
+    SharedHeading("People interested in your home", "Review applications for your own listings.")
+    SharedText("New ${model.applications.count { it.status == "SUBMITTED" }} · Under review ${model.applications.count { it.status == "UNDER_REVIEW" }} · Approved ${model.applications.count { it.status == "APPROVED" }}", true)
+    Gap(12)
     var count by remember(model.applications) { mutableIntStateOf(20) }
-    model.applications.take(count).forEach { value -> SharedCard {
-        SharedText(model.listings.firstOrNull { it.id == value.listingId }?.title ?: "Shared-home application")
-        SharedStatus(value.status); SharedLink("Review application", !model.busy) { model.openApplication(value) }
-    } }
+    var hidden by remember { mutableStateOf(false) }
+    TextButton({ hidden = !hidden }) { Text(if (hidden) "Show applications" else "Hidden applications") }
+    model.applicationListingFilter?.let { id ->
+        TextButton({ model.go(SharedScreen.APPLICATIONS) }, enabled = !model.busy) { Text("Show applications for all listings") }
+    }
+    val displayed = model.applications.filter { app -> (model.applicationListingFilter == null || app.listingId == model.applicationListingFilter) && (model.applicationNotes.firstOrNull { it.applicationId == app.id }?.hidden == true) == hidden }
+    displayed.take(count).forEach { value ->
+        ApplicationCard(value, model.listings.firstOrNull { it.id == value.listingId }?.title ?: "Shared home",
+            model.applicationNotes.firstOrNull { it.applicationId == value.id }, model.busy,
+            onView = { model.openApplication(value) }, onRestore = { model.hideApplication(value.id, false) },
+            onChat = { model.openApplicationChat(value) })
+    }
     if (model.applications.isEmpty()) SharedText("No applications yet.", true)
-    if (count < model.applications.size) SharedLink("Load more", true) { count += 20 }
+    if (count < displayed.size) SharedLink("Load more", true) { count += 20 }
 }
 @Composable private fun SharedApplication(model: SublessorViewModel) {
     val value = model.application ?: return
     var rejecting by remember(value.id) { mutableStateOf(false) }
     var reason by remember(value.id) { mutableStateOf("") }
-    SharedHeading("Review application", model.listings.firstOrNull { it.id == value.listingId }?.title ?: "Shared home")
+    ApplicationFacts(value, model.listings.firstOrNull { it.id == value.listingId }?.title ?: "Shared home")
     SharedCard {
-        SharedStatus(value.status)
-        SharedText("Submitted · ${value.createdAt.substringBefore('T')}", true)
         if (value.status == "SUBMITTED") SharedButton("Mark under review", !model.busy) { model.decide("review") }
         if (value.status == "UNDER_REVIEW") {
             SharedButton("Approve application", !model.busy) { model.decide("approve") }
@@ -332,8 +413,10 @@ import java.util.Locale
                 SharedButton("Confirm rejection", !model.busy && reason.isNotBlank()) { model.decide("reject", reason) }
             }
         }
-        value.rejectionReason?.let { SharedText(it) }
     }
+    val booking = model.bookings.firstOrNull { it.sourceApplicationId == value.id }
+    OwnerMoveInCard(booking, model.busy, model.testDestination?.configured, { model.go(SharedScreen.PAYMENTS) },
+        { booking?.let { model.confirmBookingMoveIn(it.id) } }, model::loadBookings)
 }
 @Composable private fun SharedInterests(model: SublessorViewModel) {
     SharedHeading("Roommate interests", "People interested in your shared spaces")
@@ -353,31 +436,34 @@ import java.util.Locale
 
 @Composable private fun SharedInbox(model: SublessorViewModel) {
     var query by rememberSaveable { mutableStateOf("") }
-    ProtectedInboxHeader("Your roommate messages", query) { query = it }
-    val visible = model.threads?.content.orEmpty().filter { value ->
-        query.isBlank() || listOf(value.id, value.roommateInterestId, value.status)
+    ProtectedInboxHeader(query) { query = it }
+    ArchiveTabs(model.archivedThreads.size, model.showArchived) { model.showArchived = it }
+    val visible = (if (model.showArchived) model.archivedThreads else model.inboxThreads).filter { value ->
+        query.isBlank() || listOfNotNull(value.counterpartyName, value.lastMessage, value.status)
             .any { it.contains(query.trim(), ignoreCase = true) }
     }
     visible.forEach { value ->
         ProtectedConversationRow(
-            title = "Verified Renter",
-            detail = "Roommate conversation · Interest ${value.roommateInterestId.take(8).uppercase()}",
-            status = value.status.lowercase().replace('_', ' ').replaceFirstChar { it.uppercase() },
-            enabled = !model.busy
+            title = value.counterpartyName ?: "Renter",
+            detail = value.lastMessage ?: "Start a conversation",
+            status = value.lastMessageAt?.let { kenyaTime(it, "d MMM yyyy") } ?: "",
+            enabled = !model.busy, avatarUrl = value.counterpartyAvatarUrl,
+            onArchive = if (model.showArchived) null else ({ model.archiveThread(value) }),
+            onRestore = if (model.showArchived) ({ model.restoreThread(value) }) else null,
+            onDelete = { model.deleteThread(value) }
         ) { model.openThread(value) }
     }
-    if (visible.isEmpty()) SharedText(if (query.isBlank()) "No conversations yet." else "No conversations match your search.", true)
+    if (visible.isEmpty()) SharedText(if (query.isNotBlank()) "No conversations match your search." else if (model.showArchived) "No archived conversations." else "No conversations yet.", true)
     if (model.threads?.last == false) SharedLink("Load more", !model.busy, model::nextThreads)
-    Gap(12)
-    SharedNote("Keep communication inside Makao Hub\nPhone numbers, email addresses and social handles are masked and flagged for both people.")
 }
 @Composable private fun SharedConversation(model: SublessorViewModel, profile: MyProfile) {
     val selectedThread = model.thread ?: return
     ProtectedConversation(
-        title = "Verified Renter",
+        title = selectedThread.counterpartyName ?: "Renter",
         roleLabel = "Renter",
         conversationType = "Roommate conversation",
-        contextLabel = "Interest ${selectedThread.roommateInterestId.take(8).uppercase()} · Conversation ${selectedThread.id.take(8).uppercase()}",
+        contextLabel = "Roommate enquiry",
+        threadId = selectedThread.id,
         messages = model.messages?.items.orEmpty(),
         ownUserId = profile.id,
         connected = model.chatReady,
@@ -388,34 +474,31 @@ import java.util.Locale
         hasOlder = model.messages?.hasMore == true,
         onOlder = model::olderMessages,
         onReconnect = model::reconnect,
+        onAcknowledge = model::acknowledgeMessages,
         onDraft = model::updateChat,
         onSend = model::sendMessage
     )
 }
 @Composable private fun SharedPayments(model: SublessorViewModel) {
-    SharedHeading("Shared-space test payments", "Your payment records")
-    SharedNote("TEST / MOCK PAYMENT\nNo real money moves.")
+    SharedHeading("Payments and payouts", "Your payment records")
+    OwnerTestPayoutSetup(model.testDestination, model.busy, model::configureTestDestination)
     model.payments?.items?.forEach { value -> SharedCard {
         SharedText(value.paymentType.lowercase().replace('_', ' ')); SharedStatus(value.status)
         SharedText("${value.currency} ${BigDecimal.valueOf(value.amountMinor, 2).toPlainString()}")
-        SharedText(value.createdAt.substringBefore('T'), true)
+        SharedText(kenyaTime(value.createdAt), true)
     } }
     if (model.payments?.items?.isEmpty() == true) SharedText("No payment records yet.", true)
     if (model.payments?.hasNext == true) SharedLink("Load more", !model.busy, model::nextPayments)
 }
 
 @Composable private fun SharedHeading(title: String, subtitle: String) {
-    Text(title, color = Brown, fontSize = 25.sp, lineHeight = 30.sp, fontWeight = FontWeight.Bold)
-    Gap(9); Text(subtitle, color = Muted, fontSize = 13.sp, lineHeight = 19.sp); Gap(20)
+    OwnerBanner(title, subtitle)
 }
 @Composable internal fun SharedCard(content: @Composable ColumnScope.() -> Unit) {
-    Surface(color = Color.White, shape = RoundedCornerShape(14.dp), border = BorderStroke(1.dp, Border), modifier = Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(15.dp), verticalArrangement = Arrangement.spacedBy(8.dp), content = content)
-    }; Gap(14)
+    StyledCard(null, content)
 }
 @Composable internal fun SharedText(text: String, muted: Boolean = false) { Text(text, color = if (muted) Muted else Ink, fontSize = 14.sp, lineHeight = 20.sp) }
-@Composable internal fun SharedStatus(value: String) { Text(value.lowercase().replace('_', ' ').replaceFirstChar { it.uppercase() },
-    color = if (value in listOf("VERIFIED", "PUBLISHED", "APPROVED", "Verified Sublessor")) Color(0xFF417653) else Muted, fontSize = 12.sp) }
+@Composable internal fun SharedStatus(value: String) { StatusPill(value) }
 @Composable internal fun SharedNote(text: String) { Surface(color = Sand, shape = RoundedCornerShape(10.dp), modifier = Modifier.fillMaxWidth()) {
     Text(text, color = Brown, fontSize = 12.sp, lineHeight = 18.sp, modifier = Modifier.padding(14.dp)) }; Gap(14) }
 @Composable internal fun SharedButton(label: String, enabled: Boolean, action: () -> Unit) { Button(action, enabled = enabled,
@@ -450,7 +533,6 @@ private fun sharedKes(value: Long) = "KSh " + NumberFormat.getIntegerInstance(Lo
     }
     SharedInput("Budget from · KSh / month", model.preferenceForm.minBudget, !model.busy, number = true) { model.preferenceForm = model.preferenceForm.copy(minBudget = it) }
     SharedInput("Budget to · KSh / month", model.preferenceForm.maxBudget, !model.busy, number = true) { model.preferenceForm = model.preferenceForm.copy(maxBudget = it) }
-    SharedNote("Shared preferences\nUse household preferences to start a conversation and discuss expectations.")
     SharedCard { Row(verticalAlignment = Alignment.CenterVertically) {
         Checkbox(model.preferenceForm.optIn, { model.preferenceForm = model.preferenceForm.copy(optIn = it) }, enabled = !model.busy)
         Column { SharedText("Opt in to roommate discovery"); SharedText("You can turn this off.", true) }
@@ -466,7 +548,6 @@ private fun sharedKes(value: Long) = "KSh " + NumberFormat.getIntegerInstance(Lo
         SharedText("How preferences work", true)
         SharedText("Compare shared household preferences and monthly budgets. A conversation helps you decide whether sharing a home feels right.")
     }
-    SharedNote("You control discovery\nOnly opted-in renters appear. Private identity documents, exact addresses and contact details are excluded.")
     SharedButton("Discover renters", !model.busy && saved.discoveryOptIn) { model.go(SharedScreen.DISCOVERY) }
     SharedLink("Edit preferences", !model.busy) { model.go(SharedScreen.PREFERENCES) }
 }
@@ -512,17 +593,16 @@ private fun sharedKes(value: Long) = "KSh " + NumberFormat.getIntegerInstance(Lo
         SharedText(PreferenceQuestion.entries.filter { mine[it] != theirs[it] }.joinToString(" · ") { it.title }.ifBlank { "No different answers" })
         SharedText("A percentage is not shown until the matching weights and rounding rule are agreed.", true)
     }
-    SharedNote("A public profile, not an ID file\nPrivate identity evidence is never shared.")
     // The current backend opens chats after a renter expresses interest and the host accepts.
     SharedButton("Open protected conversations", !model.busy) { model.go(SharedScreen.INBOX) }
 }
 
-/** ID front/back, a camera selfie and a private agreement PDF; READY never means identity approval. */
+/** The same three-photo identity checklist used by every public role. */
 @Composable private fun SublessorVerification(model: SublessorViewModel) {
     val resolver = LocalContext.current.contentResolver
-    var step by rememberSaveable { mutableIntStateOf(1) }
-    var idBack by rememberSaveable { mutableStateOf(false) }
     var correcting by rememberSaveable { mutableStateOf(false) }
+    var started by rememberSaveable { mutableStateOf(false) }
+    var roleProof by rememberSaveable { mutableStateOf(false) }
     var choosing by remember { mutableStateOf<SharedEvidence?>(null) }
     var sourceFor by remember { mutableStateOf<SharedEvidence?>(null) }
     var camera by remember { mutableStateOf<SharedEvidence?>(null) }
@@ -530,89 +610,64 @@ private fun sharedKes(value: Long) = "KSh " + NumberFormat.getIntegerInstance(Lo
         val type = choosing; choosing = null
         if (uri != null && type != null) model.uploadEvidence(type, resolver, uri)
     }
-    fun choose(type: SharedEvidence) { choosing = type; picker.launch(if (type == SharedEvidence.RENTAL_AGREEMENT) arrayOf("application/pdf") else arrayOf("image/jpeg", "image/png")) }
     val status = model.verification?.status
     val terminal = status in listOf("PENDING", "VERIFIED") || status == "REJECTED" && !correcting
-    val back = { if (!model.busy) {
-        if (camera != null) camera = null
-        else if (!terminal && step == 2 && idBack) idBack = false
-        else if (!terminal && step > 1) step-- else model.go(SharedScreen.HOME)
-    } }
+    val editable = status in listOf("NOT_STARTED", "REJECTED")
+    fun capture(type: SharedEvidence) {
+        val stored = model.documents.firstOrNull { it.documentType == type.name }
+        when {
+            model.pendingEvidenceType == type.name -> model.retryEvidence()
+            stored?.status == "UPLOADING" -> model.confirmStoredEvidence(stored.documentId)
+            type == SharedEvidence.SELFIE -> camera = type
+            else -> sourceFor = type
+        }
+    }
+    val back = { if (!model.busy) { if (camera != null) camera = null else if (roleProof) roleProof = false else if (started && !terminal) started = false else model.go(SharedScreen.HOME) } }
     BackHandler(onBack = back)
     LaunchedEffect(status) { if (status in listOf("PENDING", "VERIFIED")) correcting = false }
     sourceFor?.let { type -> IdSourceDialog(type.title, { sourceFor = null },
-        { sourceFor = null; camera = type }, { sourceFor = null; choose(type) }) }
-    if (!terminal && step == 1) {
-        PageBody(back, !model.busy) {
-            model.notice?.let { SharedNote(it); Gap(8) }
-            VerificationIntro(
-                role = "Sublessor",
-                subtitle = "Confirms your identity and rental agreement for the shared space.",
-                roleDocument = "Rental agreement",
-                onStart = { step = 2 }
-            )
-        }
-        return
-    }
-    if (!terminal && step == 2) {
-        val type = if (idBack) SharedEvidence.ID_BACK else SharedEvidence.ID_FRONT
-        PageBody(back, !model.busy) {
-            model.notice?.let { SharedNote(it); Gap(8) }
-            if (camera != null) {
-                Heading(if (idBack) "Back of your ID" else "Front of your ID"); Gap(20)
-                key(type) { EvidenceCamera(false, !model.busy, { bitmap -> camera = null; model.captureEvidence(type, bitmap) }, model::showNotice) }
-                SharedLink("Cancel camera", !model.busy) { camera = null }
-            } else IdDocumentStep(idBack, model.documents.firstOrNull { it.documentType == type.name },
-                pending = model.pendingEvidenceType == type.name, busy = model.busy,
-                editable = status in listOf("NOT_STARTED", "REJECTED"), progress = model.evidenceProgress, stage = model.stage, name = model.evidenceNames[type],
-                frontReady = sharedEvidenceReady(SharedEvidence.ID_FRONT, model.documents),
-                choose = { sourceFor = type }, retry = {
-                    if (model.pendingEvidenceType == type.name) model.retryEvidence()
-                    else model.documents.firstOrNull { it.documentType == type.name }?.let { model.confirmStoredEvidence(it.documentId) }
-                }, next = { if (!idBack) idBack = true else step = 3 })
-        }
-        return
-    }
-    PageBody(back, !model.busy) {
+        { sourceFor = null; camera = type },
+        { sourceFor = null; choosing = type; picker.launch(arrayOf("image/jpeg", "image/png")) }) }
+    VerificationPageBody(back, { model.go(SharedScreen.HOME) }, !model.busy, if (!started && !terminal) "Verification" else "Capture documents") {
         model.notice?.let { SharedNote(it); Gap(8) }
         when {
             terminal -> VerificationOutcomeScreen(
                 role = "Sublessor", status = status!!, rejectionReason = model.verification?.rejectionReason,
                 busy = model.busy, approvedAction = "Continue to listings",
-                onApproved = { model.go(SharedScreen.LISTINGS) },
-                onCorrect = { correcting = true; step = 2; idBack = false },
+                onApproved = { model.go(SharedScreen.LISTINGS) }, onCorrect = { correcting = true },
                 onClose = { model.go(SharedScreen.HOME) }, onRefresh = model::refreshVerification)
+            !started && editable -> VerificationIntro("Sublessor", "Confirms your identity and tenancy for a shared space.", "Rental agreement (PDF)") { started = true }
             camera != null -> {
                 val type = camera!!
-                Heading(if (type == SharedEvidence.SELFIE) "A quick selfie" else type.title)
-                Gap(20)
-                key(type) { EvidenceCamera(type == SharedEvidence.SELFIE, !model.busy,
+                Heading(if (type == SharedEvidence.SELFIE) "Capture selfie" else type.title); Gap(20)
+                key(type) { EvidenceCamera(type == SharedEvidence.SELFIE, editable && !model.busy,
                     { bitmap -> camera = null; model.captureEvidence(type, bitmap) }, model::showNotice) }
                 SharedLink("Cancel camera", !model.busy) { camera = null }
             }
-            step == 3 -> {
-                val ready = sharedEvidenceReady(SharedEvidence.SELFIE, model.documents)
-                VerificationSelfieStep(ready, model.busy) {
-                    if (ready) step = 4 else camera = SharedEvidence.SELFIE
-                }
+            roleProof -> VerificationRoleDocumentStep(
+                title = "Your rental agreement", subtitle = "Sublessor · Confirm your shared-space tenancy",
+                label = "Rental agreement", name = model.evidenceNames[SharedEvidence.RENTAL_AGREEMENT],
+                ready = sharedEvidenceReady(SharedEvidence.RENTAL_AGREEMENT, model.documents), busy = model.busy,
+                guidance = "Include the tenant name, property and relevant signed pages.",
+                privacy = "Only authorised verification staff can view this document.",
+                choose = { choosing = SharedEvidence.RENTAL_AGREEMENT; picker.launch(arrayOf("application/pdf")) },
+                next = model::submitVerification)
+            else -> {
+                val types = listOf(SharedEvidence.ID_FRONT, SharedEvidence.ID_BACK, SharedEvidence.SELFIE)
+                IdentityCaptureChecklist(
+                    role = "Sublessor", busy = model.busy, editable = editable,
+                    stage = model.stage, progress = model.evidenceProgress,
+                    items = types.map { type -> IdentityCaptureItem(
+                        type.name,
+                        when (type) { SharedEvidence.ID_FRONT -> "National ID (front)"; SharedEvidence.ID_BACK -> "National ID (back)"; else -> "Selfie" },
+                        when (type) { SharedEvidence.ID_FRONT -> "Photo side, fit the card inside the frame"; SharedEvidence.ID_BACK -> "Turn the card over, all four corners visible"; else -> "Remove spectacles, face the camera" },
+                        model.pendingEvidenceType != type.name && sharedEvidenceReady(type, model.documents),
+                        model.busy && model.pendingEvidenceType == type.name
+                    ) },
+                    onCapture = { key -> capture(SharedEvidence.valueOf(key)) },
+                    onContinue = { roleProof = true }
+                )
             }
-            step == 4 -> VerificationRoleDocumentStep(
-                title = "Your rental agreement",
-                subtitle = "Sublessor · Confirm your shared-space tenancy",
-                label = "Rental agreement",
-                name = model.evidenceNames[SharedEvidence.RENTAL_AGREEMENT],
-                ready = sharedEvidenceReady(SharedEvidence.RENTAL_AGREEMENT, model.documents),
-                busy = model.busy,
-                guidance = "Signed agreement\nInclude the tenant name, property and relevant signed pages.\n\nShared space\nFor a spare room or servant quarter, not a whole-property landlord listing.",
-                privacy = "Only verification staff can view this\nRoommate discovery does not expose your agreement or exact address.",
-                choose = { choose(SharedEvidence.RENTAL_AGREEMENT) }, next = { step = 5 })
-            else -> VerificationReviewSummary(
-                roleDocument = "Rental agreement", ready = sharedVerificationReady(model.documents), busy = model.busy,
-                submit = model::submitVerification, replace = { step = 2; idBack = false })
         }
-        model.documents.filter { it.status == "UPLOADING" && model.pendingEvidence == null }.forEach { value ->
-            SharedLink("Confirm ${value.documentType.lowercase().replace('_', ' ')}", !model.busy) { model.confirmStoredEvidence(value.documentId) }
-        }
-        if (model.pendingEvidence != null) SharedButton("Retry current document", !model.busy, model::retryEvidence)
     }
 }

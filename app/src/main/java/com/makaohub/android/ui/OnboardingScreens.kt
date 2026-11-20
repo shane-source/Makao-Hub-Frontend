@@ -33,20 +33,12 @@ import com.makaohub.android.data.SignupRole
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
-val Brown = Color(0xFF573B2D)
-val Cream = Color(0xFFFAF7F1)
+val Brown = Color(0xFF672D06)
+val Cream = Color.White
 val Ink = Color(0xFF403B36)
 val Muted = Color(0xFF887F74)
 val Border = Color(0xFFE7E0D6)
-val Sand = Color(0xFFEDE2D7)
-
-/** Native system bars stay native; all app-owned content follows the supplied reference. */
-@Composable
-fun MakaoTheme(content: @Composable () -> Unit) {
-    MaterialTheme(colorScheme = lightColorScheme(primary = Brown, onPrimary = Color.White,
-        background = Cream, surface = Cream, onSurface = Ink, onBackground = Ink,
-        outline = Border), content = content)
-}
+val Sand = Color(0xFFFFE8C1)
 
 /** Scrollable on small screens and when the keyboard or large accessibility fonts are used. */
 @Composable

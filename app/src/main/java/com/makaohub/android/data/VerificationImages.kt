@@ -35,29 +35,32 @@ internal object VerificationImages {
                 output.toByteArray() else null
         } finally { image.recycle() }
     }
-    fun fromUri(resolver: ContentResolver, uri: Uri): ByteArray {
+    fun fromUri(resolver: ContentResolver, uri: Uri, forAvatar: Boolean = false): ByteArray {
         val mime = resolver.getType(uri)?.lowercase()
-        if (mime !in listOf("image/jpeg", "image/png", "image/webp")) throw VerificationImageRejected()
+        val accepted = if (forAvatar) listOf("image/jpeg", "image/png", "image/webp", "image/heic", "image/heif")
+            else listOf("image/jpeg", "image/png", "image/webp")
+        if (mime !in accepted) throw VerificationImageRejected()
+        val sourceLimit = if (forAvatar) 25_000_000 else MAX_BYTES
         val encoded = resolver.openInputStream(uri)?.use { input ->
             val output = ByteArrayOutputStream()
             val buffer = ByteArray(8192)
             while (true) {
                 val count = input.read(buffer)
                 if (count < 0) break
-                if (output.size() + count > MAX_BYTES) throw VerificationImageRejected()
+                if (output.size() + count > sourceLimit) throw VerificationImageRejected()
                 output.write(buffer, 0, count)
             }
             output.toByteArray()
         } ?: throw VerificationImageRejected()
         val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeByteArray(encoded, 0, encoded.size, options)
-        if (!validVerificationImageDimensions(options.outWidth, options.outHeight)) throw VerificationImageRejected()
+        if (options.outWidth <= 0 || options.outHeight <= 0 || options.outWidth.toLong() * options.outHeight > (if (forAvatar) 100_000_000L else 25_000_000L)) throw VerificationImageRejected()
         options.inJustDecodeBounds = false
         options.inSampleSize = 1
         while (maxOf(options.outWidth, options.outHeight) / options.inSampleSize > 2400) options.inSampleSize *= 2
         val decoded = BitmapFactory.decodeByteArray(encoded, 0, encoded.size, options) ?: throw VerificationImageRejected()
         try {
-            val orientation = if (mime == "image/jpeg") {
+            val orientation = if (mime in listOf("image/jpeg", "image/heic", "image/heif")) {
                 ByteArrayInputStream(encoded).use { ExifInterface(it).getAttributeInt(
                     ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL) }
             } else ExifInterface.ORIENTATION_NORMAL

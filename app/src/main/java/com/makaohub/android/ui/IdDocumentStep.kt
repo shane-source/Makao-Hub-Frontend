@@ -4,18 +4,130 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.Badge
+import androidx.compose.material.icons.outlined.CheckCircle
+import androidx.compose.material.icons.outlined.Face
+import androidx.compose.material.icons.outlined.Close
+import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.makaohub.android.data.OwnerVerificationDocument
+
+internal data class IdentityCaptureItem(
+    val key: String,
+    val title: String,
+    val detail: String,
+    val ready: Boolean,
+    val checking: Boolean
+)
+
+@Composable
+internal fun VerificationPageBody(onBack: () -> Unit, onClose: () -> Unit, enabled: Boolean, title: String = "Capture documents", content: @Composable ColumnScope.() -> Unit) {
+    Surface(color = Color(0xFFFAF7F4), modifier = Modifier.fillMaxSize()) {
+        Column(Modifier.fillMaxSize().safeDrawingPadding().imePadding().verticalScroll(rememberScrollState()).padding(horizontal = 24.dp).padding(bottom = 24.dp)) {
+            Row(Modifier.fillMaxWidth().height(72.dp), verticalAlignment = Alignment.CenterVertically) {
+                IconButton(onClick = onBack, enabled = enabled) { Icon(Icons.AutoMirrored.Outlined.ArrowBack, "Back", tint = Brown) }
+                Text(title, modifier = Modifier.weight(1f), textAlign = TextAlign.Center, color = Ink, fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
+                IconButton(onClick = onClose, enabled = enabled) { Icon(Icons.Outlined.Close, "Close verification", tint = Brown) }
+            }
+            content()
+        }
+    }
+}
+
+/** One shared identity checklist for landlord, sublessor and renter. */
+@Composable
+internal fun IdentityCaptureChecklist(
+    role: String,
+    items: List<IdentityCaptureItem>,
+    busy: Boolean,
+    editable: Boolean,
+    stage: String?,
+    progress: Int?,
+    onCapture: (String) -> Unit,
+    onContinue: () -> Unit
+) {
+    Text("$role identity documents", color = Muted, fontSize = 13.sp)
+    Gap(14)
+    LinearProgressIndicator(
+        progress = { items.count { it.ready } / items.size.toFloat() },
+        modifier = Modifier.fillMaxWidth().height(5.dp).clip(CircleShape),
+        color = Color(0xFFD8752A), trackColor = Border, drawStopIndicator = {}
+    )
+    Gap(20)
+    Heading("Let’s verify it’s you")
+    Gap(8)
+    BodyCopy("Tap each item to take a photo. We check the upload straight away; your documents are reviewed after submission.", muted = true)
+    Gap(18)
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        listOf("Clear", "No glare", "Face visible").forEach { label ->
+            Surface(color = Sand, shape = RoundedCornerShape(20.dp)) {
+                Text(label, color = Muted, fontSize = 12.sp, modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp))
+            }
+        }
+    }
+    Gap(18)
+    items.forEach { item ->
+        Surface(
+            color = Color.White,
+            shape = RoundedCornerShape(14.dp),
+            border = BorderStroke(1.dp, if (item.ready) Color(0xFF80AB8E) else Border),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Row(
+                Modifier.padding(horizontal = 14.dp, vertical = 20.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Surface(color = if (item.ready) Color(0xFFEBF4EF) else Sand, shape = RoundedCornerShape(12.dp)) {
+                    Box(Modifier.size(50.dp), contentAlignment = Alignment.Center) {
+                        Icon(
+                            if (item.key == "SELFIE") Icons.Outlined.Face else Icons.Outlined.Badge,
+                            contentDescription = null,
+                            tint = if (item.ready) Color(0xFF417653) else Brown,
+                            modifier = Modifier.size(25.dp)
+                        )
+                    }
+                }
+                Column(Modifier.weight(1f)) {
+                    Text(item.title, color = Ink, fontSize = 15.sp, fontWeight = FontWeight.Bold)
+                    Text(item.detail, color = Muted, fontSize = 12.sp, lineHeight = 17.sp)
+                    if (item.checking && stage != null) {
+                        Text(
+                            if (progress != null && stage.startsWith("Uploading")) "$stage $progress%" else stage,
+                            color = Brown, fontSize = 12.sp
+                        )
+                    }
+                }
+                when {
+                    item.ready -> IconButton(onClick = { onCapture(item.key) }, enabled = editable && !busy) {
+                        Icon(Icons.Outlined.CheckCircle, "Upload checked. Tap to replace", tint = Color(0xFF417653), modifier = Modifier.size(27.dp))
+                    }
+                    item.checking -> CircularProgressIndicator(Modifier.size(24.dp), strokeWidth = 2.dp, color = Brown)
+                    else -> TextButton(onClick = { onCapture(item.key) }, enabled = editable && !busy) {
+                        Text("Capture", color = Brown, fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+        }
+        Gap(12)
+    }
+    Gap(6)
+    PrimaryButton("Continue", enabled = editable && !busy && items.all { it.ready }, onClick = onContinue)
+}
 
 @Composable
 internal fun VerificationIntro(role: String, subtitle: String, roleDocument: String?, onStart: () -> Unit) {

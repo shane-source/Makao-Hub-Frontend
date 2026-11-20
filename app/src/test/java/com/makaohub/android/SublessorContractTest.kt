@@ -22,6 +22,15 @@ class SublessorContractTest {
     @Before fun setup() { Dispatchers.setMain(UnconfinedTestDispatcher()); server = MockWebServer(); server.start(); auth = AuthRepository(createMakaoApi(server.url("/").toString())); repository = SublessorRepository(auth) }
     @After fun close() { server.shutdown(); Dispatchers.resetMain() }
 
+    @Test fun removingAListingArchivesItThroughTheOwnedRoute() = runBlocking {
+        login()
+        response("""{"id":"room","title":"Room","description":"Quiet","spaceType":"SPARE_ROOM","monthlyRentKes":18000,"bathroomCount":1,"furnished":false,"status":"ARCHIVED","createdAt":"2026-10-15T06:00:00Z","updatedAt":"2026-10-15T06:00:00Z"}""")
+        assertEquals("ARCHIVED", repository.transition("room", "archive").status)
+        val request = server.takeRequest()
+        assertEquals("POST", request.method)
+        assertEquals("/api/v1/sublessor/listings/room/archive", request.path)
+        assertEquals("Bearer synthetic", request.getHeader("Authorization"))
+    }
     @Test fun landlordSessionCannotRequestSublessorData() = runBlocking {
         login("LANDLORD")
         assertThrows(WorkspaceUnavailable::class.java) { runBlocking { repository.listings() } }

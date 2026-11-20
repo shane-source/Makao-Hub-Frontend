@@ -2,23 +2,60 @@ package com.makaohub.android.data
 
 import com.google.gson.JsonParser
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import okhttp3.OkHttpClient
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import retrofit2.HttpException
 import retrofit2.Retrofit
 import retrofit2.converter.gson.GsonConverterFactory
 import java.io.IOException
 import java.util.concurrent.TimeUnit
 
-/** Owns the in-memory session. No password, OTP or JWT is written to disk or logs. */
-class AuthRepository(private val api: MakaoApi) {
+/** Serializes session updates and optionally stores them encrypted on the device. */
+class AuthRepository(private val api: MakaoApi, private val sessionStore: SessionStore? = null) {
     private val sessionLock = Mutex()
     private var tokens: AuthTokens? = null
+    @Volatile private var inactive = false
+    val wasInactive: Boolean get() = inactive || sessionStore?.wasInactive == true
+    fun recordActivity(wallMillis: Long, elapsedMillis: Long) {
+        if (tokens != null && !inactive) try { sessionStore?.recordActivity(wallMillis, elapsedMillis) } catch (_: Exception) { discardStoredSession() }
+    }
+    fun expireLocally() { inactive = true; discardStoredSession() }
+
+    suspend fun restore(): Boolean = sessionLock.withLock {
+        if (inactive) return@withLock false
+        if (tokens == null) tokens = sessionStore?.read()
+        inactive = false
+        tokens != null
+    }
+    val sessionRole: String? get() = if (inactive) null else tokens?.role
+    private fun discardStoredSession() { try { sessionStore?.clear() } catch (_: Exception) { } }
+    private fun persistSession(value: AuthTokens) {
+        try { sessionStore?.write(value) } catch (_: Exception) { discardStoredSession() }
+    }
 
     suspend fun register(body: RegisterRequest) = api.register(body)
-    suspend fun login(body: LoginRequest) = api.login(body)
-    suspend fun google(idToken: String, expectedRole: SignupRole) = api.google(GoogleRequest(idToken, expectedRole))
+    /** Returns null when the account was signed in directly, or a code challenge when one is still needed. */
+    suspend fun login(body: LoginRequest): OtpChallenge? = signInOutcome(api.login(body), body.expectedRole)
+    suspend fun google(idToken: String, expectedRole: SignupRole): OtpChallenge? =
+        signInOutcome(api.google(GoogleRequest(idToken, expectedRole)), expectedRole)
+
+    private suspend fun signInOutcome(reply: SignInReply, expectedRole: SignupRole): OtpChallenge? {
+        val access = reply.accessToken
+        val refresh = reply.refreshToken
+        if (!access.isNullOrEmpty() && !refresh.isNullOrEmpty()) {
+            installSession(AuthTokens(access, refresh, reply.role.orEmpty(), reply.userId.orEmpty()), expectedRole)
+            return null
+        }
+        val id = reply.challengeId ?: throw IOException("Sign-in could not start.")
+        return OtpChallenge(id, reply.purpose.orEmpty(), reply.maskedEmail.orEmpty(), reply.expiresAt.orEmpty())
+    }
 
     /** Registration returns only an OTP challenge; it does not create a session. */
     suspend fun registerGoogle(body: GoogleRegisterRequest) = api.googleRegister(body)
@@ -29,29 +66,108 @@ class AuthRepository(private val api: MakaoApi) {
             OtpFlow.REGISTRATION -> api.verifyRegistrationOtp(request)
             OtpFlow.GOOGLE_LOGIN -> api.verifyGoogleOtp(request)
             OtpFlow.LOGIN -> api.verifyOtp(request)
+            OtpFlow.REACTIVATION -> api.verifyReactivationOtp(request)
         }
+        installSession(response, expectedRole)
+    }
+
+    private suspend fun installSession(response: AuthTokens, expectedRole: SignupRole) {
         // Defense against an old/misconfigured server: never install a wrong-role session.
         if (response.role != expectedRole.name) {
-            sessionLock.withLock { tokens = null }
+            sessionLock.withLock { tokens = null; discardStoredSession() }
             try { api.logout(RefreshRequest(response.refreshToken)).requireSuccess() }
             catch (cancel: CancellationException) { throw cancel }
             catch (_: Exception) { /* Revocation is best effort; these tokens are never retained locally. */ }
             throw LoginRoleMismatch()
         }
-        sessionLock.withLock { tokens = response }
+        sessionLock.withLock { discardStoredSession(); inactive = false; tokens = response; persistSession(response) }
     }
 
     /** One serialized refresh prevents concurrent calls replaying a rotated refresh token. */
     suspend fun profile(): MyProfile = authorized { api, header -> api.profile(header) }
 
-    /** Reuse the same serialized session/refresh path for every protected workspace call. */
-    suspend fun <T> authorized(requiredRole: String? = null, action: suspend (MakaoApi, String) -> T): T = sessionLock.withLock {
-        val current = tokens ?: throw SessionExpired()
-        if (requiredRole != null && current.role != requiredRole) throw WorkspaceUnavailable()
+    suspend fun completePhone(phone: String) = authorized { api, header ->
+        api.completePhone(header, CompletePhoneRequest(phone)).requireSuccess()
+    }
+
+    suspend fun startAccountAction(email: String, action: String) = authorized { api, header ->
+        api.startAccountAction(header, AccountActionStartRequest(email, action))
+    }
+
+    suspend fun confirmAccountAction(email: String, action: String, challengeId: String, code: String) =
+        authorized { api, header ->
+            api.confirmAccountAction(header, AccountActionConfirmRequest(email, action, challengeId, code)).requireSuccess()
+        }
+
+    suspend fun uploadAvatar(bytes: ByteArray) = authorized { api, header ->
+        val capabilities = api.avatarCapabilities(header)
+        check(capabilities.validation == "normalized-jpeg-png-v1")
+        val ticket = api.avatarTicket(header, AvatarUploadRequest("image/jpeg"))
+        val url = ticket.uploadUrl.toHttpUrl()
+        check(url.isHttps && url.host.endsWith(".supabase.co") && url.username.isEmpty() && url.password.isEmpty())
+        val client = OkHttpClient.Builder().followRedirects(false).followSslRedirects(false)
+            .retryOnConnectionFailure(false).callTimeout(20, TimeUnit.SECONDS).build()
+        withContext(Dispatchers.IO) {
+            client.newCall(Request.Builder().url(url)
+                .put(bytes.toRequestBody("image/jpeg".toMediaType())).build()).execute().use { response ->
+                if (!response.isSuccessful) throw MediaTransferFailed()
+            }
+        }
+        api.confirmAvatar(header, AvatarConfirmRequest(ticket.objectPath)).requireSuccess()
+    }
+
+    suspend fun deleteAvatar() = authorized { api, header -> api.deleteAvatar(header).requireSuccess() }
+
+    /**
+     * Protected calls run side by side. The lock is held only to read the session and to refresh it,
+     * never while waiting on the network, so one slow request can no longer stall every other screen.
+     */
+    suspend fun <T> authorized(requiredRole: String? = null, action: suspend (MakaoApi, String) -> T): T {
+        val used = sessionLock.withLock {
+            if (inactive) throw SessionExpired()
+            val current = tokens ?: throw SessionExpired()
+            if (requiredRole != null && current.role != requiredRole) throw WorkspaceUnavailable()
+            current
+        }
         try {
-            action(api, "Bearer ${current.accessToken}")
+            return action(api, "Bearer ${used.accessToken}")
         } catch (error: HttpException) {
             if (error.code() != 401) throw error
+        }
+        return retryWithFreshSession(used, requiredRole, action)
+    }
+
+    /**
+     * Header for a long-lived connection such as the chat socket. A socket cannot retry on 401, so the access token
+     * is refreshed first when it has less than seven minutes left; the server only delivers to a socket whose token is valid.
+     */
+    suspend fun <T> authorizedForSocket(requiredRole: String? = null, action: suspend (String) -> T): T {
+        val used = sessionLock.withLock {
+            if (inactive) throw SessionExpired()
+            val current = tokens ?: throw SessionExpired()
+            if (requiredRole != null && current.role != requiredRole) throw WorkspaceUnavailable()
+            current
+        }
+        if (secondsLeft(used.accessToken) > 420) return action("Bearer ${used.accessToken}")
+        return retryWithFreshSession(used, requiredRole) { _, header -> action(header) }
+    }
+
+    private fun secondsLeft(token: String): Long = try {
+        val payload = String(android.util.Base64.decode(token.split('.')[1], android.util.Base64.URL_SAFE or android.util.Base64.NO_PADDING or android.util.Base64.NO_WRAP), Charsets.UTF_8)
+        org.json.JSONObject(payload).getLong("exp") - System.currentTimeMillis() / 1000
+    } catch (_: Exception) { 0L }
+
+    /** One serialized refresh prevents concurrent calls replaying a rotated refresh token. */
+    private suspend fun <T> retryWithFreshSession(used: AuthTokens, requiredRole: String?, action: suspend (MakaoApi, String) -> T): T = sessionLock.withLock {
+        if (inactive) throw SessionExpired()
+        val current = tokens ?: throw SessionExpired()
+        val fresh: AuthTokens
+        if (current.accessToken != used.accessToken) {
+            // Another call refreshed the session while this one was in flight. Use it; never replay the old refresh token.
+            fresh = current
+        } else {
+            // A rotated refresh token must never be replayed after an interrupted request.
+            try { sessionStore?.clearForRefresh() } catch (_: Exception) { tokens = null; throw SessionExpired() }
             val refreshed = try {
                 api.refresh(RefreshRequest(current.refreshToken))
             } catch (cancel: CancellationException) {
@@ -62,13 +178,16 @@ class AuthRepository(private val api: MakaoApi) {
                 tokens = null
                 throw SessionExpired()
             }
+            if (inactive) { tokens = null; discardStoredSession(); throw SessionExpired() }
             tokens = refreshed
-            if (requiredRole != null && refreshed.role != requiredRole) throw WorkspaceUnavailable()
-            try { action(api, "Bearer ${refreshed.accessToken}") }
-            catch (failure: HttpException) {
-                if (failure.code() == 401) { tokens = null; throw SessionExpired() }
-                throw failure
-            }
+            persistSession(refreshed)
+            fresh = refreshed
+        }
+        if (requiredRole != null && fresh.role != requiredRole) throw WorkspaceUnavailable()
+        try { action(api, "Bearer ${fresh.accessToken}") }
+        catch (failure: HttpException) {
+            if (failure.code() == 401) { tokens = null; discardStoredSession(); throw SessionExpired() }
+            throw failure
         }
     }
 
@@ -79,8 +198,20 @@ class AuthRepository(private val api: MakaoApi) {
     suspend fun logout() = sessionLock.withLock {
         val current = tokens
         tokens = null
+        discardStoredSession()
         if (current != null) api.logout(RefreshRequest(current.refreshToken)).requireSuccess()
     }
+
+    /** Revoke only the expired session; never sign out a newer login. */
+    suspend fun revokeInactiveSession() = sessionLock.withLock {
+        if (!inactive) return@withLock
+        val current = tokens
+        tokens = null
+        discardStoredSession()
+        if (current != null) api.logout(RefreshRequest(current.refreshToken)).requireSuccess()
+    }
+
+    suspend fun forgetSession() = sessionLock.withLock { tokens = null; discardStoredSession() }
 
     private fun retrofit2.Response<Unit>.requireSuccess() {
         if (!isSuccessful) throw HttpException(this)
@@ -91,7 +222,7 @@ class SessionExpired : Exception()
 class WorkspaceUnavailable : Exception()
 class LoginRoleMismatch : Exception()
 
-enum class OtpFlow { REGISTRATION, LOGIN, GOOGLE_LOGIN }
+enum class OtpFlow { REGISTRATION, LOGIN, GOOGLE_LOGIN, REACTIVATION }
 
 /** No HTTP body logger and no automatic retries of OTP/payment-like POST requests. */
 private val evidenceConfirmPath = Regex("^/api/v1/(landlord|sublessor|renter)/verification/documents/[^/]+/confirm$")
@@ -109,7 +240,7 @@ fun createMakaoApi(baseUrl: String): MakaoApi {
     // Bounded server download + scan + normalization can exceed the ordinary request budget.
     val evidence = normal.newBuilder().readTimeout(75, TimeUnit.SECONDS).callTimeout(90, TimeUnit.SECONDS).build()
     return Retrofit.Builder().baseUrl(baseUrl)
-        .callFactory { request -> (if (isEvidenceConfirmation(request.url.encodedPath)) evidence else normal).newCall(request) }
+        .callFactory { request -> (if (isEvidenceConfirmation(request.url.encodedPath) || request.url.encodedPath == "/api/v1/profile/me/avatar/confirm") evidence else normal).newCall(request) }
         .addConverterFactory(GsonConverterFactory.create())
         .build().create(MakaoApi::class.java)
 }

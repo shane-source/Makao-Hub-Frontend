@@ -54,15 +54,27 @@ class AuthContractTest {
         assertEquals("Bearer signup-access", server.takeRequest().getHeader("Authorization"))
     }
 
-    @Test fun googleSignupOmitsPhoneAndKeepsSelectedRoleAndOtpGate() = runBlocking {
+    @Test fun profilePhotoRemovalUsesAuthenticatedAccount() = runBlocking {
+        respond(tokens("test-access", "test-refresh"))
+        repository.verify("test-challenge", "123456", OtpFlow.LOGIN, SignupRole.SUBLESSOR)
+        server.takeRequest()
+        respond("", 204)
+        repository.deleteAvatar()
+        val request = server.takeRequest()
+        assertEquals("DELETE", request.method)
+        assertEquals("/api/v1/profile/me/avatar", request.path)
+        assertEquals("Bearer test-access", request.getHeader("Authorization"))
+    }
+
+    @Test fun googleSignupIncludesPhoneAndKeepsSelectedRoleAndOtpGate() = runBlocking {
         respond(challenge, 201)
-        repository.registerGoogle(GoogleRegisterRequest("synthetic-google-token", "", SignupRole.LANDLORD, true))
+        repository.registerGoogle(GoogleRegisterRequest("synthetic-google-token", "", SignupRole.LANDLORD, true, "0712345678"))
         val request = server.takeRequest()
         assertEquals("/api/v1/auth/google/register", request.path)
         val body = JsonParser.parseString(request.body.readUtf8()).asJsonObject
         assertEquals("LANDLORD", body["role"].asString)
         assertTrue(body["termsAndPrivacyAccepted"].asBoolean)
-        assertFalse(body.has("phoneNumber"))
+        assertEquals("0712345678", body["phoneNumber"].asString)
         assertFalse(body.has("password"))
         try { repository.profile(); fail("Google signup still requires email OTP") }
         catch (_: SessionExpired) { }
@@ -225,7 +237,7 @@ class AuthContractTest {
             try { repository.profile(); fail("Mismatch must remain unauthenticated") }
             catch (_: SessionExpired) { }
         }
-        assertEquals(6, server.requestCount)
+        assertEquals(OtpFlow.entries.size * 2, server.requestCount)
     }
 
     @Test fun wrongRoleTokensStayDiscardedWhenServerRevocationFails() = runBlocking {

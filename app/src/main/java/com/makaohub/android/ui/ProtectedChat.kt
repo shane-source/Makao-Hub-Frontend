@@ -23,11 +23,32 @@ import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.MoreVert
+import androidx.compose.material.icons.outlined.Search
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material.icons.outlined.Send
+import androidx.compose.runtime.mutableIntStateOf
+import kotlinx.coroutines.delay
+import androidx.compose.material.icons.outlined.Done
+import androidx.compose.material.icons.outlined.DoneAll
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.makaohub.android.data.OwnerMessage
@@ -38,17 +59,23 @@ private val WarningSurface = Color(0xFFFFF1CC)
 
 /** Shared visual contract for the three role-specific inboxes. It searches only fields already returned by the server. */
 @Composable
-internal fun ProtectedInboxHeader(subtitle: String, query: String, onQuery: (String) -> Unit) {
-    Text("Conversations that feel safe", color = Brown, fontSize = 28.sp, lineHeight = 33.sp,
-        fontWeight = FontWeight.Bold, letterSpacing = (-0.4).sp)
-    Gap(9)
-    Text(subtitle, color = Muted, fontSize = 15.sp, lineHeight = 22.sp)
-    Gap(20)
+internal fun ProtectedInboxHeader(query: String, onQuery: (String) -> Unit) {
+    var searching by rememberSaveable { mutableStateOf(query.isNotEmpty()) }
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
+        Text("Messages", color = Ink, fontFamily = FontFamily.Serif, fontSize = 28.sp, fontWeight = FontWeight.Bold)
+        Surface(shape = CircleShape, color = Color.White, border = BorderStroke(1.dp, Border)) {
+            IconButton(onClick = { searching = !searching; if (!searching) onQuery("") }) {
+                Icon(Icons.Outlined.Search, contentDescription = if (searching) "Close search" else "Search conversations", tint = Ink)
+            }
+        }
+    }
+    if (searching) {
+    Gap(12)
     OutlinedTextField(
         value = query,
         onValueChange = { onQuery(it.take(100)) },
         label = { Text("Search conversations") },
-        placeholder = { Text("Role or reference") },
+        placeholder = { Text("Name or message") },
         singleLine = true,
         shape = RoundedCornerShape(14.dp),
         colors = OutlinedTextFieldDefaults.colors(
@@ -57,7 +84,28 @@ internal fun ProtectedInboxHeader(subtitle: String, query: String, onQuery: (Str
         ),
         modifier = Modifier.fillMaxWidth()
     )
+    }
     Gap(18)
+}
+
+/** Switches an inbox between live conversations and the ones the person archived. */
+@Composable
+internal fun ArchiveTabs(archivedCount: Int, showingArchived: Boolean, onChange: (Boolean) -> Unit) {
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        listOf(false to "Inbox", true to "Archived ($archivedCount)").forEach { (archived, label) ->
+            val selected = showingArchived == archived
+            Surface(
+                onClick = { onChange(archived) },
+                shape = RoundedCornerShape(50),
+                color = if (selected) Ink else Color.White,
+                border = BorderStroke(1.dp, Border)
+            ) {
+                Text(label, color = if (selected) Color.White else Ink, fontSize = 14.sp, fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp))
+            }
+        }
+    }
+    Gap(14)
 }
 
 /** One accessible conversation summary. Disabled rows explain locked or closed state without offering a dead action. */
@@ -67,41 +115,61 @@ internal fun ProtectedConversationRow(
     detail: String,
     status: String,
     enabled: Boolean,
+    avatarUrl: String? = null,
+    onArchive: (() -> Unit)? = null,
+    onRestore: (() -> Unit)? = null,
+    onDelete: (() -> Unit)? = null,
     onOpen: () -> Unit
 ) {
+    var menu by remember { mutableStateOf(false) }
+    var confirmDelete by remember { mutableStateOf(false) }
     Surface(
+        onClick = onOpen,
+        enabled = enabled,
         color = Color.White,
         shape = RoundedCornerShape(16.dp),
         border = BorderStroke(1.dp, Border),
         modifier = Modifier.fillMaxWidth()
     ) {
-        Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(7.dp)) {
-            Text(title, color = Ink, fontSize = 16.sp, fontWeight = FontWeight.Medium)
-            Text(detail, color = Ink, fontSize = 14.sp, lineHeight = 20.sp)
-            Text(status, color = if (enabled) Success else Warning, fontSize = 12.sp)
-            if (enabled) {
-                TextButton(onClick = onOpen, contentPadding = PaddingValues(0.dp)) {
-                    Text("Open conversation", color = Brown, fontWeight = FontWeight.SemiBold)
-                }
+        Row(Modifier.padding(16.dp), horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
+          ProfileAvatar(avatarUrl, Modifier.size(48.dp))
+          Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(7.dp)) {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                Text(title, modifier = Modifier.weight(1f), color = Ink, fontSize = 16.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                if (status.isNotBlank()) Text(status, color = Muted, fontSize = 11.sp, maxLines = 1)
             }
+            Text(detail, color = Muted, fontSize = 14.sp, lineHeight = 20.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+          }
+          if (onArchive != null || onRestore != null || onDelete != null) Box {
+            IconButton(onClick = { menu = true }, enabled = enabled) {
+                Icon(Icons.Outlined.MoreVert, contentDescription = "Conversation options", tint = Muted)
+            }
+            DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                onArchive?.let { act -> DropdownMenuItem(text = { Text("Archive") }, onClick = { menu = false; act() }) }
+                onRestore?.let { act -> DropdownMenuItem(text = { Text("Move to inbox") }, onClick = { menu = false; act() }) }
+                onDelete?.let { DropdownMenuItem(text = { Text("Delete") }, onClick = { menu = false; confirmDelete = true }) }
+            }
+          }
         }
     }
+    if (confirmDelete) AlertDialog(
+        onDismissRequest = { confirmDelete = false },
+        title = { Text("Delete this conversation?") },
+        text = { Text("It disappears from your list only. The other person keeps it, and it comes back if they send a new message.") },
+        confirmButton = { TextButton(onClick = { confirmDelete = false; onDelete?.invoke() }) { Text("Delete") } },
+        dismissButton = { TextButton(onClick = { confirmDelete = false }) { Text("Cancel") } }
+    )
     Gap(14)
 }
 
-/**
- * Role-neutral protected chat presentation.
- *
- * Messages are rendered only from server responses. An outgoing message is described as "Saved" because the
- * ViewModels add it only after the server echo; this component intentionally does not invent typing, delivery,
- * read-receipt, counterparty-presence, report, block, or close-conversation states.
- */
+/** A single tick is server-confirmed; two ticks require a recipient delivery receipt. */
 @Composable
 internal fun ProtectedConversation(
     title: String,
     roleLabel: String,
     conversationType: String,
-    contextLabel: String,
+    @Suppress("UNUSED_PARAMETER") contextLabel: String,
+    threadId: String,
     messages: List<OwnerMessage>,
     ownUserId: String,
     connected: Boolean,
@@ -112,14 +180,14 @@ internal fun ProtectedConversation(
     hasOlder: Boolean,
     onOlder: () -> Unit,
     onReconnect: () -> Unit,
+    onAcknowledge: (List<String>) -> Boolean,
     onDraft: (String) -> Unit,
     onSend: () -> Unit
 ) {
     Text(title, color = Brown, fontSize = 28.sp, lineHeight = 33.sp,
         fontWeight = FontWeight.Bold, letterSpacing = (-0.4).sp)
     Gap(9)
-    Text("$roleLabel · ${if (connected) "Protected chat connected" else "Reconnecting"}",
-        color = Muted, fontSize = 15.sp, lineHeight = 22.sp)
+    Text(roleLabel, color = Muted, fontSize = 15.sp, lineHeight = 22.sp)
     Gap(15)
     Row(verticalAlignment = Alignment.CenterVertically) {
         Surface(color = Brown, shape = CircleShape, modifier = Modifier.size(9.dp)) {}
@@ -128,9 +196,20 @@ internal fun ProtectedConversation(
     }
     Gap(18)
 
-    SharedNote("Keep communication inside Makao Hub\nPhone numbers, email addresses and social handles are masked and flagged by the server.")
-    Text(contextLabel, color = Muted, fontSize = 12.sp)
-    Gap(14)
+    val readContext = androidx.compose.ui.platform.LocalContext.current
+    val newestServerAt = messages.filter { it.senderId != "__me__" }.maxOfOrNull { it.createdAt }
+    LaunchedEffect(threadId, newestServerAt) { ChatSeen.mark(readContext, threadId, newestServerAt) }
+    androidx.compose.runtime.DisposableEffect(threadId) { onDispose { ChatSeen.mark(readContext, threadId, newestServerAt) } }
+
+    val acknowledged = remember(threadId, connected) { mutableSetOf<String>() }
+    LaunchedEffect(threadId, connected, messages) {
+        if (connected) {
+            val incoming = messages.filter { it.senderId != ownUserId && it.senderId != "__me__" && it.deliveredAt == null && it.id !in acknowledged }.map { it.id }
+            for (batch in incoming.chunked(100)) {
+                if (onAcknowledge(batch)) acknowledged.addAll(batch) else break
+            }
+        }
+    }
 
     if (hasOlder) {
         TextButton(onClick = onOlder, enabled = !busy, contentPadding = PaddingValues(0.dp)) {
@@ -147,7 +226,7 @@ internal fun ProtectedConversation(
         }
     }
     ordered.forEach { message ->
-        val own = message.senderId == ownUserId
+        val own = message.senderId == ownUserId || message.senderId == "__me__"
         Box(Modifier.fillMaxWidth(), contentAlignment = if (own) Alignment.CenterEnd else Alignment.CenterStart) {
             Surface(
                 color = if (own) Sand else Color.White,
@@ -158,47 +237,47 @@ internal fun ProtectedConversation(
                 Column(Modifier.padding(15.dp), verticalArrangement = Arrangement.spacedBy(7.dp)) {
                     Text(message.content, color = Ink, fontSize = 15.sp, lineHeight = 22.sp)
                     val time = protectedChatTime(message.createdAt)
-                    Text(
-                        buildString {
-                            if (time.isNotBlank()) append(time).append(" · ")
-                            append(if (message.contactMasked) "Flagged contact attempt · masked" else if (own) "Saved" else "Received")
-                        },
-                        color = if (message.contactMasked) Warning else Muted,
-                        fontSize = 11.sp
-                    )
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text(if (message.contactMasked) "$time · Contact masked" else time,
+                            color = if (message.contactMasked) Warning else Muted, fontSize = 11.sp)
+                        if (own) Icon(if (message.deliveredAt != null) Icons.Outlined.DoneAll else Icons.Outlined.Done,
+                            contentDescription = if (message.deliveredAt != null) "Delivered" else "Sent",
+                            tint = Muted, modifier = Modifier.size(16.dp))
+                    }
                 }
             }
         }
         Gap(12)
     }
 
-    if (ordered.any { it.contactMasked }) {
-        StatusNotice(
-            title = "Contact details removed",
-            body = "The attempted contact share was masked and flagged. Continue safely in this conversation."
-        )
-    }
-
     if (!threadOpen) {
         StatusNotice("Conversation closed", "Saved messages remain visible, but new messages cannot be sent.")
         return
     }
-    if (!connected) {
-        StatusNotice("Reconnecting…", "Saved messages remain visible. Reconnect before sending.")
-        OutlinedButton(onClick = onReconnect, enabled = !busy, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) {
-            Text("Reconnect protected chat", color = Brown, fontWeight = FontWeight.SemiBold)
+    // Connect automatically and keep retrying with a short back-off; no manual button.
+    var attempt by remember(threadId) { mutableIntStateOf(0) }
+    LaunchedEffect(threadId, connected, attempt) {
+        if (connected) attempt = 0
+        else {
+            delay((800L * (attempt + 1)).coerceAtMost(4_000L))
+            onReconnect()
+            attempt++
         }
-        Gap(14)
     }
+    val canSend = connected && !awaitingEcho && draft.isNotBlank()
     OutlinedTextField(
         value = draft,
         onValueChange = { onDraft(it.take(2_000)) },
-        label = { Text("Message") },
-        placeholder = { Text("Write a message…") },
-        enabled = connected && !awaitingEcho,
-        minLines = 3,
-        maxLines = 6,
-        shape = RoundedCornerShape(13.dp),
+        placeholder = { Text(if (connected) "Write a message…" else "Connecting…") },
+        minLines = 1,
+        maxLines = 5,
+        shape = RoundedCornerShape(24.dp),
+        trailingIcon = {
+            IconButton(onClick = onSend, enabled = canSend) {
+                Icon(Icons.Outlined.Send, contentDescription = "Send message",
+                    tint = if (canSend) Brown else Muted)
+            }
+        },
         colors = OutlinedTextFieldDefaults.colors(
             focusedContainerColor = Color.White,
             unfocusedContainerColor = Color.White,
@@ -206,20 +285,12 @@ internal fun ProtectedConversation(
         ),
         modifier = Modifier.fillMaxWidth()
     )
-    Gap(12)
-    Button(
-        onClick = onSend,
-        enabled = connected && !awaitingEcho && draft.isNotBlank(),
-        shape = RoundedCornerShape(12.dp),
-        modifier = Modifier.fillMaxWidth().heightIn(min = 50.dp)
-    ) {
-        Text(if (awaitingEcho) "Waiting for saved message…" else "Send message", fontWeight = FontWeight.SemiBold)
-    }
+    Gap(8)
 }
 
 /** ISO timestamps are displayed without parsing failures affecting the conversation. */
 internal fun protectedChatTime(value: String): String =
-    value.substringAfter('T', "").take(5).takeIf { it.length == 5 } ?: ""
+    kenyaTime(value, "h:mm a")
 
 @Composable
 private fun StatusNotice(title: String, body: String) {

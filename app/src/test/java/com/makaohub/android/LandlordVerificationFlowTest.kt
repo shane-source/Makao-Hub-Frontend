@@ -131,9 +131,12 @@ class LandlordVerificationFlowTest {
         repeat(4) { server.takeRequest() }
 
         respond("""{"id":"listing-1","status":"DRAFT","moderation_status":"PENDING","updated_at":"2026-10-21T06:00:00Z"}""")
+        respond("[]"); respond("[]")
         model.manage(model.listings.single()); waitForWork()
         assertEquals(OwnerScreen.EDIT,model.screen)
         assertEquals("/api/v1/landlord/listings/listing-1/review",server.takeRequest().path)
+        assertEquals("/api/v1/amenities",server.takeRequest().path)
+        assertEquals("/api/v1/landlord/listings/listing-1/amenities",server.takeRequest().path)
 
         respond("""{"id":"listing-1","status":"DRAFT","moderation_status":"PENDING","updated_at":"2026-10-21T06:00:00Z"}""")
         respond("""[{"id":"photo","listingId":"listing-1","mediaType":"IMAGE","contentType":"image/jpeg","sizeBytes":3,"sortOrder":0,"createdAt":"2026-10-21T06:00:00Z","confirmed":true}]""")
@@ -177,7 +180,9 @@ class LandlordVerificationFlowTest {
     @Test fun mediaManagementNeedsASelectedRecordAndDeletionFailureKeepsItRetryable() = runBlocking {
         val listing = OwnerListing("listing-1", "Test home", "Synthetic", "HOUSE", 10000,
             1, 1, false, null, "DRAFT", "2026-10-21T06:00:00Z", "2026-10-21T06:00:00Z")
-        model.edit(listing)
+        respond("[]"); respond("[]")
+        model.edit(listing); waitForWork()
+        server.takeRequest(); server.takeRequest()
         model.manageMedia("unknown")
         assertEquals(OwnerScreen.EDIT, model.screen)
         assertNull(model.selectedMediaId)

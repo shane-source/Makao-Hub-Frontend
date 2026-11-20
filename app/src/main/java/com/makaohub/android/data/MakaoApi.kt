@@ -28,17 +28,54 @@ class ResetPasswordRequest(val email: String, val code: String, val newPassword:
 class RefreshRequest(val refreshToken: String)
 class GoogleRequest(val idToken: String, val expectedRole: SignupRole)
 class GoogleRegisterRequest(val idToken: String, val fullName: String,
-    val role: SignupRole, val termsAndPrivacyAccepted: Boolean)
+    val role: SignupRole, val termsAndPrivacyAccepted: Boolean, val phoneNumber: String = "")
 class AcceptedResponse(val message: String)
 class ReportRequest(val subjectKind: String, val subjectId: String, val category: String, val description: String)
 class ReportResponse(val reportId: String, val state: String)
 class OtpChallenge(val challengeId: String, val purpose: String, val maskedEmail: String, val expiresAt: String)
+/** Sign-in answers with tokens, or with a code challenge when a code is still needed (deactivated or unlinked Google accounts). */
+class SignInReply(val challengeId: String?, val purpose: String?, val maskedEmail: String?, val expiresAt: String?,
+    val accessToken: String?, val refreshToken: String?, val role: String?, val userId: String?)
 class AuthTokens(val accessToken: String, val refreshToken: String, val role: String, val userId: String)
 class MyProfile(val id: String, val fullName: String, val email: String, val role: String,
-    val accountStatus: String, val verificationStatus: String?, val phoneNumber: String? = null)
+    val accountStatus: String, val verificationStatus: String?, val phoneNumber: String? = null,
+    val avatarUrl: String? = null)
 
 /** Paths and JSON names match the Spring Boot AuthController and ProfileController. */
 interface MakaoApi {
+    @GET("api/v1/amenities") suspend fun amenities(@Header("Authorization") h:String):List<AmenityOption>
+    @GET("api/v1/{kind}/listings/{id}/amenities") suspend fun listingAmenities(@Header("Authorization") h:String,@Path("kind") kind:String,@Path("id") id:String):List<AmenityOption>
+    @PUT("api/v1/{kind}/listings/{id}/amenities") suspend fun saveListingAmenities(@Header("Authorization") h:String,@Path("kind") kind:String,@Path("id") id:String,@Body body:AmenitySelection):List<AmenityOption>
+    @GET("api/v1/renter/listings/{kind}/{id}/amenities") suspend fun renterListingAmenities(@Header("Authorization") h:String,@Path("kind") kind:String,@Path("id") id:String):List<AmenityOption>
+
+    @GET("api/v1/{role}/application-notes") suspend fun applicationNotes(@Header("Authorization") h:String,@Path("role") role:String):List<ApplicationNote>
+    @PUT("api/v1/{role}/applications/{id}/hidden") suspend fun hideApplication(@Header("Authorization") h:String,@Path("role") role:String,@Path("id") id:String,@Body body:ApplicationHidden):Response<Unit>
+    @PUT("api/v1/{role}/applications/{id}/remark") suspend fun remarkApplication(@Header("Authorization") h:String,@Path("role") role:String,@Path("id") id:String,@Body body:ApplicationRemark):Response<Unit>
+    @GET("api/v1/landlord/applications/{id}/conversation") suspend fun landlordApplicationConversation(@Header("Authorization") h:String,@Path("id") id:String):OwnerThread
+    @GET("api/v1/sublessor/applications/{id}/conversation") suspend fun sublessorApplicationConversation(@Header("Authorization") h:String,@Path("id") id:String):SharedThread
+    @GET("api/v1/renter/{type}/{id}/remark") suspend fun renterApplicationRemark(@Header("Authorization") h:String,@Path("type") type:String,@Path("id") id:String):ApplicationRemarkResponse
+    @GET("api/v1/landlord/offers/listing-card-metrics") suspend fun landlordCardMetrics(@Header("Authorization") h:String):List<ListingCardMetrics>
+    @GET("api/v1/sublessor/offers/listing-card-metrics") suspend fun sublessorCardMetrics(@Header("Authorization") h:String):List<ListingCardMetrics>
+    @GET("api/v1/landlord/offers") suspend fun landlordOffers(@Header("Authorization") h:String):LandlordOffers
+    @GET("api/v1/sublessor/offers") suspend fun sublessorOffers(@Header("Authorization") h:String):LandlordOffers
+    @POST("api/v1/landlord/offers/checkout") suspend fun landlordOfferCheckout(@Header("Authorization") h:String,@Header("Idempotency-Key") key:String,@Body body:LandlordOfferPurchase):OwnerPayment
+    @POST("api/v1/sublessor/offers/checkout") suspend fun sublessorOfferCheckout(@Header("Authorization") h:String,@Header("Idempotency-Key") key:String,@Body body:LandlordOfferPurchase):OwnerPayment
+    @POST("api/v1/landlord/offers/boost-credit/redeem") suspend fun landlordRedeemBoost(@Header("Authorization") h:String,@Body body:BoostRedeemBody):BoostRedeemResult
+    @POST("api/v1/sublessor/offers/boost-credit/redeem") suspend fun sublessorRedeemBoost(@Header("Authorization") h:String,@Body body:BoostRedeemBody):BoostRedeemResult
+    @GET("api/v1/{role}/bookings") suspend fun ownerBookings(@Header("Authorization") h:String,@Path("role") role:String):List<OwnerBooking>
+    @POST("api/v1/{role}/bookings/{id}/agreement/confirm") suspend fun ownerConfirmTerms(@Header("Authorization") h:String,@Path("role") role:String,@Path("id") id:String):OwnerBooking
+    @POST("api/v1/{role}/bookings/{id}/move-in/confirm") suspend fun ownerConfirmMoveIn(@Header("Authorization") h:String,@Path("role") role:String,@Path("id") id:String,@Header("Idempotency-Key") key:String):OwnerBooking
+    @POST("api/v1/renter/bookings/{id}/move-in/response") suspend fun renterMoveInResponse(@Header("Authorization") h:String,@Path("id") id:String,@Header("Idempotency-Key") key:String,@Body body:MoveInAnswer):RenterBooking
+    @GET("api/v1/notifications") suspend fun notifications(@Header("Authorization") h:String):List<InboxNotification>
+    @PATCH("api/v1/notifications/{id}/read") suspend fun readNotification(@Header("Authorization") h:String,@Path("id") id:String):Response<Unit>
+    @GET("api/v1/profile/me/avatar/capabilities") suspend fun avatarCapabilities(@Header("Authorization") h:String):AvatarCapabilities
+    @POST("api/v1/profile/me/avatar/upload-url") suspend fun avatarTicket(@Header("Authorization") h:String,@Body body:AvatarUploadRequest):AvatarUploadTicket
+    @DELETE("api/v1/profile/me/avatar") suspend fun deleteAvatar(@Header("Authorization") h:String):Response<Unit>
+    @POST("api/v1/profile/me/avatar/confirm") suspend fun confirmAvatar(@Header("Authorization") h:String,@Body body:AvatarConfirmRequest):Response<Unit>
+    @POST("api/v1/profile/me/phone/complete") suspend fun completePhone(@Header("Authorization") h:String,@Body body:CompletePhoneRequest):Response<Unit>
+    @POST("api/v1/profile/me/account-action/start") suspend fun startAccountAction(@Header("Authorization") h:String,@Body body:AccountActionStartRequest):OtpChallenge
+    @POST("api/v1/profile/me/account-action/confirm") suspend fun confirmAccountAction(@Header("Authorization") h:String,@Body body:AccountActionConfirmRequest):Response<Unit>
+    @POST("api/v1/auth/reactivate/verify-otp") suspend fun verifyReactivationOtp(@Body body:VerifyOtpRequest):AuthTokens
     @GET("api/v1/renter/verification") suspend fun renterVerification(@Header("Authorization") h:String):OwnerVerification
     @GET("api/v1/renter/verification/documents") suspend fun renterDocuments(@Header("Authorization") h:String):List<OwnerVerificationDocument>
     @POST("api/v1/renter/verification/documents/upload-url") suspend fun renterTicket(@Header("Authorization") h:String,@Body body:VerificationUploadRequest):VerificationUploadTicket
@@ -57,7 +94,7 @@ interface MakaoApi {
     @GET("api/v1/renter/listings/{id}/media/video") suspend fun unlockedVideos(@Header("Authorization") h:String,@Path("id") id:String):List<HomeMedia>
     @GET("api/v1/renter/applications") suspend fun renterApplications(@Header("Authorization") h:String):List<OwnerApplication>
     @GET("api/v1/renter/sublessor-applications") suspend fun renterSharedApplications(@Header("Authorization") h:String):List<OwnerApplication>
-    @POST("api/v1/renter/{kind}/listing/{id}") suspend fun renterApply(@Header("Authorization") h:String,@Path("kind") kind:String,@Path("id") id:String):OwnerApplication
+    @POST("api/v1/renter/{kind}/listing/{id}") suspend fun renterApply(@Header("Authorization") h:String,@Path("kind") kind:String,@Path("id") id:String,@Body body:ApplyBody):OwnerApplication
     @DELETE("api/v1/renter/{kind}/{id}") suspend fun renterWithdraw(@Header("Authorization") h:String,@Path("kind") kind:String,@Path("id") id:String):OwnerApplication
     @POST("api/v1/renter/bookings/{kind}/{id}") suspend fun renterBook(@Header("Authorization") h:String,@Path("kind") kind:String,@Path("id") id:String):RenterBooking
     @GET("api/v1/renter/bookings/{id}") suspend fun renterBooking(@Header("Authorization") h:String,@Path("id") id:String):RenterBooking
@@ -70,9 +107,9 @@ interface MakaoApi {
     @POST("api/v1/reports") suspend fun report(@Header("Authorization") h:String,@Body body:ReportRequest):ReportResponse
     @POST("api/v1/auth/register") suspend fun register(@Body body: RegisterRequest): OtpChallenge
     @POST("api/v1/auth/register/verify-otp") suspend fun verifyRegistrationOtp(@Body body: VerifyOtpRequest): AuthTokens
-    @POST("api/v1/auth/login") suspend fun login(@Body body: LoginRequest): OtpChallenge
+    @POST("api/v1/auth/login") suspend fun login(@Body body: LoginRequest): SignInReply
     @POST("api/v1/auth/login/verify-otp") suspend fun verifyOtp(@Body body: VerifyOtpRequest): AuthTokens
-    @POST("api/v1/auth/google") suspend fun google(@Body body: GoogleRequest): OtpChallenge
+    @POST("api/v1/auth/google") suspend fun google(@Body body: GoogleRequest): SignInReply
     @POST("api/v1/auth/google/register") suspend fun googleRegister(@Body body: GoogleRegisterRequest): OtpChallenge
     @POST("api/v1/auth/google/verify-otp") suspend fun verifyGoogleOtp(@Body body: VerifyOtpRequest): AuthTokens
     @POST("api/v1/auth/forgot-password") suspend fun forgotPassword(@Body body: ForgotPasswordRequest): AcceptedResponse
@@ -95,11 +132,13 @@ interface MakaoApi {
     @GET("api/v1/landlord/listings/{id}/review") suspend fun landlordListingReview(@Header("Authorization") auth: String, @Path("id") id: String): OwnerListingReview
     @POST("api/v1/landlord/listings/{id}/submit-review") suspend fun submitLandlordListingReview(@Header("Authorization") auth: String, @Path("id") id: String): Response<Unit>
     @POST("api/v1/landlord/listings/{id}/revise-review") suspend fun reviseLandlordListingReview(@Header("Authorization") auth: String, @Path("id") id: String): Response<Unit>
+    @POST("api/v1/landlord/listings/{id}/archive") suspend fun archiveListing(@Header("Authorization") auth: String, @Path("id") id: String): OwnerListing
     @POST("api/v1/landlord/listings/{id}/pause") suspend fun pauseListing(@Header("Authorization") auth: String, @Path("id") id: String): OwnerListing
     @POST("api/v1/landlord/listings/{id}/resume") suspend fun resumeListing(@Header("Authorization") auth: String, @Path("id") id: String): OwnerListing
     @GET("api/v1/landlord/listings/{id}/location") suspend fun ownerLocation(@Header("Authorization") auth: String, @Path("id") id: String): OwnerLocation
     @PUT("api/v1/landlord/listings/{id}/location") suspend fun saveLocation(@Header("Authorization") auth: String, @Path("id") id: String, @Body body: OwnerLocation): OwnerLocation
     @GET("api/v1/landlord/listings/{id}/media") suspend fun ownerMedia(@Header("Authorization") auth: String, @Path("id") id: String): List<OwnerMedia>
+    @GET("api/v1/landlord/listings/{id}/photos") suspend fun ownerPhotos(@Header("Authorization") auth: String, @Path("id") id: String): List<HomeMedia>
     @POST("api/v1/landlord/listings/{id}/media/upload-url") suspend fun mediaUpload(@Header("Authorization") auth: String, @Path("id") id: String, @Body body: MediaUploadRequest): MediaUploadTicket
     @POST("api/v1/landlord/listings/{id}/media/{media}/confirm") suspend fun confirmMedia(@Header("Authorization") auth: String, @Path("id") id: String, @Path("media") media: String): OwnerMedia
     @DELETE("api/v1/landlord/listings/{id}/media/{media}") suspend fun deleteMedia(@Header("Authorization") auth: String, @Path("id") id: String, @Path("media") media: String): Response<Unit>
@@ -109,9 +148,14 @@ interface MakaoApi {
     @POST("api/v1/landlord/applications/{id}/reject") suspend fun rejectApplication(@Header("Authorization") auth: String, @Path("id") id: String, @Body body: OwnerApplicationRejection): OwnerApplication
     @GET("api/v1/landlord/rental-chat/threads") suspend fun landlordThreads(@Header("Authorization") auth: String, @Query("page") page: Int, @Query("size") size: Int = 20): OwnerPage<OwnerThread>
     @GET("api/v1/landlord/rental-chat/threads/{id}/messages") suspend fun landlordMessages(@Header("Authorization") auth: String, @Path("id") id: String, @Query("cursor") cursor: String?, @Query("limit") limit: Int = 50): OwnerMessagePage
+    @POST("api/v1/support/chat") suspend fun jiraniChat(@Header("Authorization") h:String,@Body body:JiraniRequest):JiraniReply
     @GET("api/v1/payments") suspend fun ownerPayments(@Header("Authorization") auth: String, @Query("page") page: Int, @Query("size") size: Int = 20): OwnerPage<OwnerPayment>
     @POST("api/v1/payments/intents") suspend fun ownerCheckout(@Header("Authorization") auth: String, @Header("Idempotency-Key") key: String, @Body body: OwnerCheckout): OwnerPayment
     @POST("api/v1/payments/mock/completions") suspend fun completeOwnerMock(@Header("Authorization") auth: String, @Body body: MockCompletion): OwnerPayment
+    @GET("api/v1/landlord/payments/test-destination") suspend fun landlordTestDestination(@Header("Authorization") auth:String):OwnerTestDestinationStatus
+    @POST("api/v1/landlord/payments/test-destination") suspend fun landlordConfigureTestDestination(@Header("Authorization") auth:String,@Header("Idempotency-Key") key:String,@Body body:OwnerTestDestinationRequest):OwnerTestDestinationStatus
+    @GET("api/v1/sublessor/payments/test-destination") suspend fun sublessorTestDestination(@Header("Authorization") auth:String):OwnerTestDestinationStatus
+    @POST("api/v1/sublessor/payments/test-destination") suspend fun sublessorConfigureTestDestination(@Header("Authorization") auth:String,@Header("Idempotency-Key") key:String,@Body body:OwnerTestDestinationRequest):OwnerTestDestinationStatus
 
     @GET("api/v1/sublessor/verification") suspend fun sublessorVerification(@Header("Authorization") auth: String): OwnerVerification
     @GET("api/v1/sublessor/verification/documents") suspend fun sublessorDocuments(@Header("Authorization") auth: String): List<OwnerVerificationDocument>
@@ -126,6 +170,7 @@ interface MakaoApi {
     @POST("api/v1/sublessor/listings/{id}/submit-review") suspend fun submitSublessorListingReview(@Header("Authorization") auth: String, @Path("id") id: String): Response<Unit>
     @POST("api/v1/sublessor/listings/{id}/revise-review") suspend fun reviseSublessorListingReview(@Header("Authorization") auth: String, @Path("id") id: String): Response<Unit>
     @GET("api/v1/sublessor/listings/{id}/location") suspend fun sharedLocation(@Header("Authorization") auth: String, @Path("id") id: String): OwnerLocation
+    @GET("api/v1/sublessor/listings/{id}/photos") suspend fun sharedPhotos(@Header("Authorization") auth: String, @Path("id") id: String): List<HomeMedia>
     @GET("api/v1/sublessor/listings/{id}/household") suspend fun sharedHousehold(@Header("Authorization") auth: String, @Path("id") id: String): SharedHousehold
     @PUT("api/v1/sublessor/listings/{id}/household") suspend fun saveSharedHousehold(@Header("Authorization") auth: String, @Path("id") id: String, @Body body: SharedHousehold): SharedHousehold
     @PUT("api/v1/sublessor/listings/{id}/location") suspend fun saveSharedLocation(@Header("Authorization") auth: String, @Path("id") id: String, @Body body: OwnerLocation): OwnerLocation
@@ -144,4 +189,8 @@ interface MakaoApi {
     @PUT("api/v1/sublessor/roommate-preferences") suspend fun saveSharedPreferences(@Header("Authorization") auth: String, @Body body: SharedPreferences): SharedPreferences
     @GET("api/v1/sublessor/roommate-discovery") suspend fun sharedDiscovery(@Header("Authorization") auth: String, @Query("page") page: Int, @Query("size") size: Int = 20): SharedDiscoveryPage
     @GET("api/v1/sublessor/roommate-discovery/{id}") suspend fun sharedRenterProfile(@Header("Authorization") auth: String, @Path("id") id: String): SharedPublicProfile
+    @GET("api/v1/{role}/chat-state") suspend fun chatStates(@Header("Authorization") h:String,@Path("role") role:String):List<ChatThreadState>
+    @PUT("api/v1/{role}/chat-state/{kind}/{id}") suspend fun setChatState(@Header("Authorization") h:String,@Path("role") role:String,@Path("kind") kind:String,@Path("id") id:String,@Body body:ChatStateBody):Response<Unit>
+    @GET("api/v1/renter/application-state") suspend fun applicationStates(@Header("Authorization") h:String):List<ApplicationStateItem>
+    @PUT("api/v1/renter/application-state/{kind}/{id}") suspend fun setApplicationState(@Header("Authorization") h:String,@Path("kind") kind:String,@Path("id") id:String,@Body body:ChatStateBody):Response<Unit>
 }

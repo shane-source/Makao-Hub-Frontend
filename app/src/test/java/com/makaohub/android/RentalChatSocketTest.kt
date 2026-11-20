@@ -36,6 +36,32 @@ class RentalChatSocketTest {
     @Test fun roommateChatUsesItsOwnQueuesAndKeepsServerMasking() =
         checkSocket(ChatChannel.ROOMMATE, "roommate-messages", "/user/queue/chat.messages", "/app/chat.send")
 
+    @Test fun deliveryAcknowledgementsUseTheCorrectChannelAndBoundedBatch() {
+        for ((channel, destination) in listOf(ChatChannel.RENTAL to "/app/rental-chat.delivered", ChatChannel.ROOMMATE to "/app/chat.delivered")) {
+            val server = MockWebServer()
+            val ready = CountDownLatch(1); val acknowledged = CountDownLatch(1)
+            var frame = ""
+            server.enqueue(MockResponse().withWebSocketUpgrade(object : WebSocketListener() {
+                override fun onMessage(webSocket: WebSocket, text: String) {
+                    if (text.startsWith("CONNECT\n")) webSocket.send("CONNECTED\nversion:1.2\n\n\u0000")
+                    else if (text.startsWith("SEND\n")) { frame = text; acknowledged.countDown() }
+                }
+                override fun onClosing(webSocket: WebSocket, code: Int, reason: String) { webSocket.close(code, reason) }
+            }))
+            server.start()
+            val socket = RentalChatSocket(server.url("/").toString(), "Bearer test-access", channel) { if (it == ChatEvent.Connected) ready.countDown() }
+            try {
+                socket.connect(); assertTrue(ready.await(5, TimeUnit.SECONDS))
+                assertFalse(socket.acknowledge("thread-1", emptyList()))
+                assertFalse(socket.acknowledge("thread-1", List(101) { "id-$it" }))
+                assertTrue(socket.acknowledge("thread-1", listOf("message-1")))
+                assertTrue(acknowledged.await(5, TimeUnit.SECONDS))
+                assertTrue(frame.contains("destination:$destination\n"))
+                assertTrue(frame.contains("\"messageIds\":[\"message-1\"]"))
+            } finally { socket.close(); server.shutdown() }
+        }
+    }
+
     private fun checkSocket(channel: ChatChannel, subscription: String, destination: String, sendDestination: String) {
         val server = MockWebServer()
         val ready = CountDownLatch(1); val echoed = CountDownLatch(1)

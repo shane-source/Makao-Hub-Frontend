@@ -9,7 +9,10 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.makaohub.android.data.*
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -28,7 +31,7 @@ enum class OwnerScreen { HOME, VERIFICATION, LISTINGS, EDIT, MEDIA, MEDIA_MANAGE
 
 internal fun nextMediaSortOrder(records: List<OwnerMedia>): Int {
     val used = records.mapTo(HashSet()) { it.sortOrder }
-    return (0..30).firstOrNull { it !in used } ?: error("No available media position")
+    return (0..250).firstOrNull { it !in used } ?: error("No available media position")
 }
 
 data class ListingForm(val title: String = "", val description: String = "", val propertyType: String = "APARTMENT",
@@ -77,20 +80,54 @@ class LandlordViewModel(private val repository: LandlordRepository, private val 
     val evidenceNames = mutableStateMapOf<OwnerEvidence, String>()
     var listings by mutableStateOf<List<OwnerListing>>(emptyList()); private set
     var applications by mutableStateOf<List<OwnerApplication>>(emptyList()); private set
+    var applicationNotes by mutableStateOf<List<ApplicationNote>>(emptyList()); private set
     var applicationsLoaded by mutableStateOf(false); private set
+    var applicationListingFilter by mutableStateOf<String?>(null); private set
+    suspend fun listingCover(id: String) = repository.cover(id)
     var selected by mutableStateOf<OwnerListing?>(null); private set
     var listingReview by mutableStateOf<OwnerListingReview?>(null); private set
     var form by mutableStateOf(ListingForm())
+    var amenityOptions by mutableStateOf<List<AmenityOption>>(emptyList()); private set
+    var selectedAmenityIds by mutableStateOf<Set<String>>(emptySet()); private set
+    fun toggleAmenity(id:String, checked:Boolean) { selectedAmenityIds = if (checked) selectedAmenityIds + id else selectedAmenityIds - id }
+    private suspend fun loadAmenities(id:String?) { amenityOptions=repository.amenities(); selectedAmenityIds=id?.let { repository.selectedAmenities(it).map { a -> a.id }.toSet() } ?: emptySet() }
     var media by mutableStateOf<List<OwnerMedia>>(emptyList()); private set
     var selectedMediaId by mutableStateOf<String?>(null); private set
     var mediaUploadError by mutableStateOf<String?>(null); private set
     var location by mutableStateOf<OwnerLocation?>(null); private set
     var selectedApplication by mutableStateOf<OwnerApplication?>(null); private set
+    var bookings by mutableStateOf<List<OwnerBooking>>(emptyList()); private set
     var threads by mutableStateOf<OwnerPage<OwnerThread>?>(null); private set
+    var chatStates by mutableStateOf<Map<String, ChatThreadState>>(emptyMap()); private set
+    var showArchived by mutableStateOf(false)
+    private fun stateOf(t: OwnerThread) = chatStates[ChatStates.key(ChatStates.RENTAL, t.id)]
+    private fun placement(t: OwnerThread) = ChatStates.placement(stateOf(t), t.lastMessageAt)
+    val inboxThreads: List<OwnerThread> get() = threads?.items.orEmpty().filter { placement(it) == ChatStates.ACTIVE }
+    val archivedThreads: List<OwnerThread> get() = threads?.items.orEmpty().filter { placement(it) == ChatStates.ARCHIVED }
+    private suspend fun loadStates() {
+        try { chatStates = repository.chatStates().associateBy { ChatStates.key(it.kind, it.threadId) } } catch (e: CancellationException) { throw e } catch (_: Exception) { }
+    }
+    /** Threads and the person's archive state arrive together so the inbox never flashes archived chats. */
+    private suspend fun loadInbox(page: Int = 0) = coroutineScope {
+        val list = async { repository.threads(page) }
+        val states = async { loadStates() }
+        states.await(); threads = list.await()
+    }
+    private fun changeState(t: OwnerThread, state: String, done: String) = run { repository.setChatState(ChatStates.RENTAL, t.id, state); loadStates(); notice = done }
+    fun archiveThread(t: OwnerThread) = changeState(t, ChatStates.ARCHIVED, "Conversation archived. Find it under Archived.")
+    fun restoreThread(t: OwnerThread) = changeState(t, ChatStates.ACTIVE, "Conversation moved back to your inbox.")
+    fun deleteThread(t: OwnerThread) = changeState(t, ChatStates.DELETED, "Conversation deleted for you. The other person still has it.")
     var thread by mutableStateOf<OwnerThread?>(null); private set
     var messages by mutableStateOf<OwnerMessagePage?>(null); private set
     var payments by mutableStateOf<OwnerPage<OwnerPayment>?>(null); private set
+    var testDestination by mutableStateOf<OwnerTestDestinationStatus?>(null); private set
     var checkout by mutableStateOf<OwnerPayment?>(null); private set
+    var cardMetrics by mutableStateOf<Map<String, ListingCardMetrics>>(emptyMap()); private set
+    suspend fun boostOffers() = repository.offers()
+    suspend fun buyBoost(code: String, listingId: String, key: String) = repository.offerCheckout(code, listingId, key)
+    suspend fun reconcileBoost(reference: String) = repository.reconcileOffer(reference)
+    suspend fun planCheckout(code: String, key: String) = repository.planCheckout(code, key)
+    suspend fun redeemIncludedBoost(listingId: String) { repository.redeemIncludedBoost(listingId) }
     var checkoutType by mutableStateOf("PLAN_UPGRADE"); private set
     var chatReady by mutableStateOf(false); private set
     var chatDraft by mutableStateOf(""); private set
@@ -101,24 +138,36 @@ class LandlordViewModel(private val repository: LandlordRepository, private val 
     private var replacingMediaId: String? = null
     val mediaUploadPending: Boolean get() = upload != null
     var pendingConfirmationId by mutableStateOf<String?>(null); private set
-    private var socket: RentalChatSocket? = null
+    private val live = LiveChat(viewModelScope, listOf(ChatChannel.RENTAL), { _, events -> repository.connectChat(BuildConfig.API_BASE_URL, events) }) { _, event -> viewModelScope.launch { liveEvent(event) } }
+    private var threadRefresh: Job? = null
     private var clientMessageId: String? = null
     var awaitingEcho by mutableStateOf(false); private set
     private var checkoutKey = UUID.randomUUID().toString()
     private var checkoutListingId: String? = null
     private var work: Job? = null
     private var generation = 0L
-    private var chatGeneration = 0L
 
     fun go(target: OwnerScreen) {
         if (busy) return
+        if (target == OwnerScreen.APPLICATIONS) applicationListingFilter = null
         if (target != OwnerScreen.CHAT) disconnectChat()
         screen = target; notice = null
         when(target) {
             OwnerScreen.HOME -> refresh()
             OwnerScreen.VERIFICATION -> loadVerification()
-            OwnerScreen.LISTINGS -> run { listings = repository.listings() }
-            OwnerScreen.APPLICATIONS -> run { applications = repository.applications(); applicationsLoaded = true }
+            OwnerScreen.LISTINGS -> run(keepCache = true) {
+                if (isFresh("listings")) return@run
+                listings = repository.listings()
+                cardMetrics = emptyMap()
+                try { cardMetrics = repository.cardMetrics().associateBy { it.listingId } }
+                catch (e: HttpException) { if (e.code() != 404 && e.code() != 503) throw e }
+                markFresh("listings")
+            }
+            OwnerScreen.APPLICATIONS -> run(keepCache = true) {
+                if (isFresh("applications")) return@run
+                applications = repository.applications(); applicationNotes = repository.notes(); applicationsLoaded = true
+                markFresh("applications")
+            }
             OwnerScreen.MESSAGES -> loadThreads()
             OwnerScreen.PAYMENTS -> loadPayments()
             OwnerScreen.CHECKS -> run {
@@ -131,13 +180,41 @@ class LandlordViewModel(private val repository: LandlordRepository, private val 
         }
     }
     fun start() = run {
-        verification = repository.verification()
-        if (verification?.status != "VERIFIED") {
-            verificationDocuments = repository.verificationDocuments()
-            screen = OwnerScreen.VERIFICATION
-        } else refreshWorkspace()
+        // Load the workspace together with the verification check. An unverified owner's early result is dropped;
+        // if the early load fails, the normal load below repeats it so errors surface as before.
+        coroutineScope {
+            val early = async {
+                try { Triple(repository.summary(), repository.listings(), repository.applications()) }
+                catch (e: CancellationException) { throw e } catch (_: Exception) { null }
+            }
+            verification = repository.verification()
+            if (verification?.status != "VERIFIED") {
+                early.cancel()
+                verificationDocuments = repository.verificationDocuments()
+                screen = OwnerScreen.VERIFICATION
+            } else {
+                val loaded = early.await()
+                if (loaded != null) {
+                    summary = loaded.first; listings = loaded.second; applications = loaded.third
+                    applicationsLoaded = true
+                } else refreshWorkspace()
+            }
+        }
     }
     fun verificationStatus(fallback: String?) = verification?.status ?: fallback ?: "NOT_STARTED"
+    /** Newest draft that was never sent for staff review; drafts already awaiting review are not "unfinished". */
+    var unfinishedDraft by mutableStateOf<OwnerListing?>(null); private set
+    fun refreshUnfinishedDraft() {
+        val drafts = listings.filter { it.status == "DRAFT" }.sortedByDescending { it.updatedAt }.take(5)
+        if (drafts.isEmpty()) { unfinishedDraft = null; return }
+        viewModelScope.launch {
+            unfinishedDraft = drafts.firstOrNull { draft ->
+                try { repository.review(draft.id).let { it.moderationStatus == "PENDING" && it.moderationSubmittedAt == null } }
+                catch (e: CancellationException) { throw e }
+                catch (_: Exception) { false }
+            }
+        }
+    }
     fun loadVerification() = run {
         verification = repository.verification()
         verificationDocuments = repository.verificationDocuments()
@@ -270,25 +347,52 @@ class LandlordViewModel(private val repository: LandlordRepository, private val 
         refreshWorkspace()
     }
     private suspend fun refreshWorkspace() {
-        summary = repository.summary()
-        listings = repository.listings()
-        applications = repository.applications()
+        coroutineScope {
+            val s = async { repository.summary() }
+            val l = async { repository.listings() }
+            val a = async { repository.applications() }
+            summary = s.await(); listings = l.await(); applications = a.await()
+        }
         applicationsLoaded = true
     }
     fun newListing() {
         if (busy) return
         if (verification?.status == "PENDING") { go(OwnerScreen.VERIFICATION); return }
-        selected = null; form = ListingForm(); resetEditor(); screen = OwnerScreen.EDIT
+        selected = null; form = ListingForm(); resetEditor(); run { loadAmenities(null); screen = OwnerScreen.EDIT }
     }
     fun edit(listing: OwnerListing) {
         if (busy) return
-        selected = listing; form = ListingForm.from(listing); resetEditor(); screen = OwnerScreen.EDIT
+        selected = listing; form = ListingForm.from(listing); resetEditor(); run { loadAmenities(listing.id); screen = OwnerScreen.EDIT }
+    }
+    fun updateListing(listing: OwnerListing) {
+        if (busy) return
+        selected = listing; resetEditor()
+        run {
+            val review = repository.review(listing.id)
+            if (listing.status != "DRAFT" || review.moderationStatus != "PENDING" || review.moderationSubmittedAt != null)
+                repository.reviseReview(listing.id)
+            listings = repository.listings()
+            selected = listings.first { it.id == listing.id }
+            form = ListingForm.from(requireNotNull(selected))
+            loadAmenities(listing.id)
+            screen = OwnerScreen.EDIT
+            notice = "Make your changes, then submit the listing for review."
+        }
+    }
+    fun removeListing(listing: OwnerListing) = run {
+        repository.transition(listing.id, "archive")
+        listings = listings.filterNot { it.id == listing.id }
+        summary = summary?.let { it.copy(totalListings = (it.totalListings - 1).coerceAtLeast(0),
+            draftListings = (it.draftListings - if (listing.status == "DRAFT") 1 else 0).coerceAtLeast(0),
+            publishedListings = (it.publishedListings - if (listing.status == "PUBLISHED") 1 else 0).coerceAtLeast(0)) }
+        notice = "Listing removed."
     }
     fun manage(listing: OwnerListing) {
         if (busy) return
         selected = listing; form = ListingForm.from(listing); resetEditor()
         run {
             listingReview = repository.review(listing.id)
+            loadAmenities(listing.id)
             screen = if (listing.status == "DRAFT" && listingReview?.moderationStatus == "PENDING"
                 && listingReview?.moderationSubmittedAt == null) OwnerScreen.EDIT else OwnerScreen.CHECKS
             if (screen == OwnerScreen.CHECKS) {
@@ -301,7 +405,11 @@ class LandlordViewModel(private val repository: LandlordRepository, private val 
     fun saveDraft(next: Boolean) {
         form.error()?.let { notice = it; return }
         run {
+            val names=amenityOptions.filter { it.id in selectedAmenityIds }.map { it.name }.toSet()
+            form=form.copy(waterAvailable="Water" in names, securityAvailable="Security" in names,
+                parkingAvailable="Parking" in names, balcony="Balcony" in names, petsAllowed="Pets allowed" in names)
             selected = repository.save(selected?.id, form.request())
+            repository.saveAmenities(selected!!.id,selectedAmenityIds)
             listingReview = null
             notice = "Draft saved. It is not visible in public search."
             if (next) { media = repository.media(selected!!.id); screen = OwnerScreen.MEDIA }
@@ -480,56 +588,123 @@ class LandlordViewModel(private val repository: LandlordRepository, private val 
         notice = when(action) { "pause" -> "Listing paused. It is hidden from discovery."; "resume" -> "Published listing resumed."; else -> "Published. Exact coordinates remain protected by the server." }
         }
     }
-    fun viewApplication(application: OwnerApplication) { if (!busy) { selectedApplication = application; notice = null; screen = OwnerScreen.APPLICATION } }
+    fun viewApplication(application: OwnerApplication) {
+        if (!busy) { selectedApplication = application; notice = null; screen = OwnerScreen.APPLICATION; loadBookings() }
+    }
+    fun loadBookings() = run {
+        bookings = try { repository.bookings() } catch (e: HttpException) { emptyList() }
+        testDestination = try { repository.testDestination() } catch (e: HttpException) { testDestination }
+    }
+    fun confirmBookingTerms(id: String) = run {
+        repository.confirmBookingTerms(id); bookings = repository.bookings(); notice = "Booking terms confirmed."
+    }
+    fun confirmBookingMoveIn(id: String) = run {
+        repository.confirmBookingMoveIn(id, java.util.UUID.randomUUID().toString()); bookings = repository.bookings()
+        notice = "Thanks! We asked your renter to confirm. Your payment is released once they answer True."
+    }
+    fun viewListingApplications(id: String) { if (!busy) { go(OwnerScreen.APPLICATIONS); applicationListingFilter = id } }
+    fun hideApplication(id: String, hidden: Boolean) = run { repository.hide(id, hidden); applicationNotes = repository.notes() }
+    fun saveApplicationRemark(id: String, value: String) = run { repository.remark(id, value); applicationNotes = repository.notes(); notice = "Remarks saved." }
+    fun decideApplication(value: OwnerApplication, action: String, reason: String? = null) = run {
+        if (value.status == "SUBMITTED") repository.decide(value.id, "review")
+        try { repository.decide(value.id, action, reason) } finally { applications = repository.applications() }
+    }
+    fun openApplicationChat(value: OwnerApplication) = run {
+        val selected = try { repository.conversation(value.id) } catch (e: HttpException) {
+            if (e.code() == 404) { notice = "No conversation is available for this application."; return@run }; throw e
+        }
+        openChat(selected)
+    }
     fun decision(action: String, reason: String? = null) = run {
         selectedApplication = repository.decide(requireNotNull(selectedApplication).id, action, reason)
         applications = repository.applications()
         notice = "Application ${requireNotNull(selectedApplication).status.lowercase().replace('_',' ')}. The server recorded the decision."
     }
-    fun loadThreads(page: Int = 0) = run { threads = repository.threads(page) }
-    fun openThread(value: OwnerThread) = run {
-        disconnectChat(); thread = value; messages = repository.messages(value.id); screen = OwnerScreen.CHAT
-        if (value.status == "OPEN") connectChat()
+    fun loadThreads(page: Int = 0) = run { loadInbox(page) }
+    /** Quiet refresh for the tab badges; never shows a spinner or an error. */
+    fun refreshBadges() { live.start(); if (busy) return; viewModelScope.launch {
+        try {
+            applications = repository.applications()
+            // An open application follows its latest status without leaving the screen.
+            if (screen == OwnerScreen.APPLICATION) selectedApplication?.let { cur -> applications.firstOrNull { it.id == cur.id }?.let { selectedApplication = it } }
+            when (screen) {
+                OwnerScreen.VERIFICATION -> if (verificationPendingId == null && verificationTicket == null) {
+                    verification = repository.verification(); verificationDocuments = repository.verificationDocuments()
+                }
+                OwnerScreen.HOME -> { verification = repository.verification(); summary = repository.summary(); listings = repository.listings() }
+                OwnerScreen.LISTINGS -> listings = repository.listings()
+                else -> Unit
+            }
+            if (screen != OwnerScreen.MESSAGES && screen != OwnerScreen.CHAT) loadInbox(0)
+        } catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (_: Exception) { }
+    } }
+    fun openThread(value: OwnerThread) = run { openChat(value) }
+    /** The chat opens at once; the live connection and the message history load side by side. */
+    private suspend fun openChat(value: OwnerThread) {
+        thread = value; messages = null; screen = OwnerScreen.CHAT; awaitingEcho = false
+        chatReady = value.status == "OPEN" && live.isReady(ChatChannel.RENTAL)
+        if (value.status == "OPEN") live.start()
+        val page = repository.messages(value.id)
+        if (thread?.id != value.id) return
+        messages = OwnerMessagePage(ChatStates.afterDelete((messages?.items.orEmpty() + page.items).distinctBy { it.id }, stateOf(value)), page.nextCursor, page.hasNext)
     }
     fun olderMessages() = run {
         val current = messages ?: return@run
         if (!current.hasNext) return@run
         val next = repository.messages(requireNotNull(thread).id, current.nextCursor)
-        messages = OwnerMessagePage((current.items + next.items).distinctBy { it.id }, next.nextCursor, next.hasNext)
+        messages = OwnerMessagePage(ChatStates.afterDelete((current.items + next.items).distinctBy { it.id }, thread?.let { stateOf(it) }), next.nextCursor, next.hasNext)
     }
-    fun reconnectChat() = run { disconnectChat(); connectChat() }
-    private suspend fun connectChat() {
-        val currentGeneration = generation
-        val currentChatGeneration = chatGeneration
-        val connected = repository.connectChat(BuildConfig.API_BASE_URL) { event -> viewModelScope.launch {
-            if (currentGeneration != generation || currentChatGeneration != chatGeneration || screen != OwnerScreen.CHAT) return@launch
-            when(event) {
-                ChatEvent.Connected -> { chatReady = true; notice = "Protected chat connected." }
-                is ChatEvent.Unavailable -> { chatReady = false; awaitingEcho = false; notice = event.text }
-                is ChatEvent.Message -> if (event.message.threadId == thread?.id) {
-                    val current = messages ?: OwnerMessagePage(emptyList(), null, false)
-                    messages = OwnerMessagePage((listOf(event.message) + current.items).distinctBy { it.id }, current.nextCursor, current.hasNext)
-                    if (event.message.clientMessageId == clientMessageId) { chatDraft = ""; clientMessageId = null; awaitingEcho = false }
-                }
-            }
-        } }
-        if (currentGeneration != generation || currentChatGeneration != chatGeneration || screen != OwnerScreen.CHAT) connected.close()
-        else socket = connected
+    fun acknowledgeMessages(ids: List<String>) = thread?.id?.let { live.socket(ChatChannel.RENTAL)?.acknowledge(it, ids) } == true
+    fun reconnectChat() { chatReady = false; live.restart() }
+    /** Every message from the live connection lands here, whichever screen is showing. */
+    private fun liveEvent(event: ChatEvent) {
+        when (event) {
+            ChatEvent.Connected -> if (thread != null) chatReady = true
+            is ChatEvent.Unavailable -> { chatReady = false; awaitingEcho = false }
+            is ChatEvent.Message -> if (screen == OwnerScreen.CHAT && event.message.threadId == thread?.id) {
+                val current = messages ?: OwnerMessagePage(emptyList(), null, false)
+                messages = OwnerMessagePage((listOf(event.message) + current.items.filter { it.id != event.message.clientMessageId }).distinctBy { it.id }.take(500), current.nextCursor, current.hasNext)
+            } else refreshThreads()
+        }
+    }
+    /** A message arrived for a chat that is not open: refresh the inbox list and unread badge quietly. */
+    private fun refreshThreads() {
+        threadRefresh?.cancel()
+        threadRefresh = viewModelScope.launch {
+            delay(300)
+            try { loadInbox(0) } catch (e: CancellationException) { throw e } catch (_: Exception) { }
+        }
     }
     fun sendMessage() {
-        if (chatDraft.isBlank() || chatDraft.length > 2000 || awaitingEcho) return
-        val id = clientMessageId ?: UUID.randomUUID().toString().also { clientMessageId = it }
-        if (socket?.send(thread?.id ?: return, id, chatDraft) == true) {
-            awaitingEcho = true; notice = "Sending. Your message appears after the server saves and masks it."
-        } else { notice = "Message not sent. Reconnect, or shorten the message to fit the server's frame limit." }
+        val text = chatDraft.trim()
+        if (text.isEmpty() || text.length > 2000) return
+        val threadId = thread?.id ?: return
+        val id = UUID.randomUUID().toString()
+        if (live.socket(ChatChannel.RENTAL)?.send(threadId, id, text) == true) {
+            val current = messages ?: OwnerMessagePage(emptyList(), null, false)
+            messages = OwnerMessagePage(listOf(OwnerMessage(id, threadId, "__me__", id, text, false, java.time.Instant.now().toString())) + current.items, current.nextCursor, current.hasNext)
+            chatDraft = ""; clientMessageId = null
+        } else { notice = "Message not sent. Reconnecting…" }
     }
     fun changeChatDraft(value: String) {
         if (awaitingEcho) return
         if (value != chatDraft) clientMessageId = null
         chatDraft = value.take(2000)
     }
-    fun disconnectChat() { chatGeneration++; socket?.close(); socket = null; chatReady = false; awaitingEcho = false }
-    fun loadPayments(page: Int = 0) = run { payments = repository.payments(page) }
+    /** Leaving a chat screen only resets the screen state; the live connection stays open. */
+    fun disconnectChat() { chatReady = false; awaitingEcho = false }
+    fun loadPayments(page: Int = 0) = run {
+        payments = repository.payments(page)
+        testDestination = repository.testDestination()
+    }
+    fun configureTestDestination(phone: String) {
+        val local = localKenyanPhone(phone)
+        if (local == null) { notice = "Enter a Kenyan M-Pesa number in 07XXXXXXXX or 01XXXXXXXX format."; return }
+        run {
+            testDestination = repository.configureTestDestination(local, UUID.randomUUID().toString())
+            notice = "Payout number saved."
+        }
+    }
     fun openCheckout(type: String, listingId: String? = null) {
         if (busy) return
         require(type == "PLAN_UPGRADE" && listingId == null || type == "BOOST" && !listingId.isNullOrBlank())
@@ -537,19 +712,26 @@ class LandlordViewModel(private val repository: LandlordRepository, private val 
         notice = null; screen = if (type == "BOOST") OwnerScreen.BOOST else OwnerScreen.PLANS
     }
     fun createCheckout() = run {
-        if (!BuildConfig.MOCK_PAYMENTS_ENABLED) { notice = "Test checkout is unavailable in this build."; return@run }
+        if (!BuildConfig.MOCK_PAYMENTS_ENABLED) { notice = "Checkout is unavailable right now."; return@run }
         checkout = repository.checkout(checkoutType, checkoutListingId, checkoutKey)
     }
     fun finishMock(outcome: String) = run {
         if (!BuildConfig.MOCK_PAYMENTS_ENABLED) return@run
         val reference = checkout?.providerReference ?: return@run
         checkout = repository.complete(reference, outcome)
-        notice = "Mock payment ${checkout!!.status.lowercase()}. No real money moved. Activation of plans and boosts needs a separate backend entitlement."
+        notice = "Payment ${checkout!!.status.lowercase()}."
     }
     fun dismissNotice() { notice = null }
     fun showNotice(value: String) { notice = value }
-    private fun run(action: suspend () -> Unit) {
+    // Short-lived in-memory cache: switching back to a tab within 15 seconds shows what is already loaded
+    // instead of waiting for the server again. Any other action clears it so changes always show up.
+    private val loadedAt = HashMap<String, Long>()
+    private fun isFresh(key: String) = System.currentTimeMillis() - (loadedAt[key] ?: 0L) < 15_000
+    private fun markFresh(key: String) { loadedAt[key] = System.currentTimeMillis() }
+
+    private fun run(keepCache: Boolean = false, action: suspend () -> Unit) {
         if (busy) return
+        if (!keepCache) loadedAt.clear()
         busy = true; notice = null
         work = viewModelScope.launch {
             try { action() }
@@ -568,7 +750,7 @@ class LandlordViewModel(private val repository: LandlordRepository, private val 
                         403 -> "Your role, verification or ownership does not permit this action."
                         404 -> "The requested listing, file or application is unavailable to this account."
                         409 -> "This action conflicts with the saved state. Refresh and check the publish or decision requirements."
-                        503 -> if (screen == OwnerScreen.VERIFICATION && verificationPendingId != null) "Document security validation is unavailable. Nothing has been approved; check the backend scanner setup, then retry confirmation." else friendlyError(e)
+                        503 -> if (screen == OwnerScreen.VERIFICATION && verificationPendingId != null) "ID checking is unavailable right now. Nothing has been approved. Please try again in a few minutes." else friendlyError(e)
                         else -> friendlyError(e)
                     }
                     else friendlyError(e)
@@ -581,10 +763,10 @@ class LandlordViewModel(private val repository: LandlordRepository, private val 
         verification = null; verificationDocuments = emptyList(); verificationTicket = null; verificationBytes = null
         verificationTransferred = false; verificationPendingId = null; evidenceProgress = null
         evidencePreviews.values.forEach { it.fill(0) }; evidencePreviews.clear(); evidenceNames.clear(); evidenceStage = null
-        disconnectChat(); location = null; media = emptyList(); selectedMediaId = null; mediaUploadError = null; localPhotos.clear(); upload = null; uploadUri = null
-        uploaded = false; replacingMediaId = null; pendingConfirmationId = null; summary = null; threads = null; applicationsLoaded = false
+        live.stop(); disconnectChat(); location = null; media = emptyList(); selectedMediaId = null; mediaUploadError = null; localPhotos.clear(); upload = null; uploadUri = null
+        uploaded = false; replacingMediaId = null; pendingConfirmationId = null; summary = null; threads = null; chatStates = emptyMap(); showArchived = false; applicationsLoaded = false
         thread = null; messages = null; chatDraft = ""; clientMessageId = null; checkout = null; payments = null
-        listings = emptyList(); applications = emptyList(); selected = null; listingReview = null; selectedApplication = null; form = ListingForm()
+        listings = emptyList(); applications = emptyList(); applicationNotes = emptyList(); applicationListingFilter = null; cardMetrics = emptyMap(); selected = null; listingReview = null; loadedAt.clear(); selectedApplication = null; form = ListingForm()
         checkoutListingId = null; checkoutKey = UUID.randomUUID().toString(); checkoutType = "PLAN_UPGRADE"
         notice = null; screen = OwnerScreen.HOME
     }

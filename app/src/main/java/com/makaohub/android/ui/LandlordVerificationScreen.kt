@@ -58,127 +58,81 @@ private val VerifyGreenFill = Color(0xFFEBF4EF)
 private val VerifyAmber = Color(0xFFE78200)
 private val VerifyRed = Color(0xFFC91D20)
 
-/** Role-specific entry with shared private-evidence steps; readiness and outcomes come only from server state. */
+/** Shared three-photo identity flow; a tick is shown only for server-confirmed READY evidence. */
 @Composable
 fun LandlordVerificationScreen(model: LandlordViewModel, @Suppress("UNUSED_PARAMETER") profile: MyProfile) {
     val context = LocalContext.current
-    var step by rememberSaveable { mutableIntStateOf(1) }
-    var idBack by rememberSaveable { mutableStateOf(false) }
     var correcting by rememberSaveable { mutableStateOf(false) }
+    var started by rememberSaveable { mutableStateOf(false) }
+    var roleProof by rememberSaveable { mutableStateOf(false) }
     var sourceFor by remember { mutableStateOf<OwnerEvidence?>(null) }
     var choosing by remember { mutableStateOf<OwnerEvidence?>(null) }
-    var cameraId by remember { mutableStateOf<OwnerEvidence?>(null) }
+    var camera by remember { mutableStateOf<OwnerEvidence?>(null) }
     val status = model.verification?.status
-    val terminal = status in listOf("PENDING", "VERIFIED") || (status == "REJECTED" && !correcting)
-    val editable = status in listOf("NOT_STARTED", "REJECTED") && !model.busy
+    val terminal = status in listOf("PENDING", "VERIFIED") || status == "REJECTED" && !correcting
+    val editable = status in listOf("NOT_STARTED", "REJECTED")
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         val type = choosing; choosing = null
         if (uri != null && type != null) model.uploadEvidence(type, context.contentResolver, uri)
     }
-    fun choose(type: OwnerEvidence) {
-        choosing = type
-        picker.launch(if (type == OwnerEvidence.OWNERSHIP_PROOF) arrayOf("application/pdf") else arrayOf("image/jpeg", "image/png"))
-    }
-    val back = {
-        if (!model.busy) {
-            if (cameraId != null) cameraId = null
-            else if (!terminal && step == 2 && idBack) idBack = false
-            else if (!terminal && step > 1) step--
-            else model.go(OwnerScreen.HOME)
+    fun capture(type: OwnerEvidence) {
+        val stored = model.verificationDocuments.firstOrNull { it.documentType == type.name }
+        when {
+            model.pendingEvidenceType == type.name -> model.retryEvidence()
+            stored?.status == "UPLOADING" -> model.confirmSavedEvidence(stored.documentId)
+            type == OwnerEvidence.SELFIE -> camera = type
+            else -> sourceFor = type
         }
     }
+    val back = { if (!model.busy) { if (camera != null) camera = null else if (roleProof) roleProof = false else if (started && !terminal) started = false else model.go(OwnerScreen.HOME) } }
     BackHandler(onBack = back)
     LaunchedEffect(status) { if (status in listOf("PENDING", "VERIFIED")) correcting = false }
-    val lifecycle = LocalLifecycleOwner.current
-    DisposableEffect(lifecycle, model, status) {
-        val observer = LifecycleEventObserver { _, event ->
-            // Never race a returning document picker with a refresh that would consume the busy gate.
-            if (event == Lifecycle.Event.ON_RESUME && status in listOf("PENDING", "VERIFIED") && !model.busy) model.loadVerification()
-        }
-        lifecycle.lifecycle.addObserver(observer)
-        onDispose { lifecycle.lifecycle.removeObserver(observer) }
-    }
     sourceFor?.let { type -> IdSourceDialog(type.title, { sourceFor = null },
-        { sourceFor = null; cameraId = type }, { sourceFor = null; choose(type) }) }
-    if (!terminal && step == 1) {
-        PageBody(back, !model.busy) {
-            model.notice?.let { SharedNote(it); Gap(8) }
-            VerificationIntro(
-                role = "Landlord",
-                subtitle = "Confirms your identity and authority to list a whole property or unit.",
-                roleDocument = "Proof of ownership",
-                onStart = { step = 2 }
-            )
-        }
-        return
-    }
-    if (!terminal && step == 2) {
-        val type = if (idBack) OwnerEvidence.ID_BACK else OwnerEvidence.ID_FRONT
-        PageBody(back, !model.busy) {
-            model.notice?.let { SharedNote(it); Gap(8) }
-            if (cameraId != null) {
-                Heading(if (idBack) "Back of your ID" else "Front of your ID"); Gap(20)
-                key(type) { EvidenceCamera(false, editable, { bitmap -> cameraId = null; model.uploadCameraEvidence(type, bitmap) }, model::showNotice) }
-                SharedLink("Cancel camera", !model.busy) { cameraId = null }
-            } else IdDocumentStep(idBack, model.verificationDocuments.firstOrNull { it.documentType == type.name },
-                pending = model.pendingEvidenceType == type.name, busy = model.busy, editable = editable,
-                progress = model.evidenceProgress, stage = model.evidenceStage, name = model.evidenceNames[type],
-                frontReady = evidenceReady(OwnerEvidence.ID_FRONT, model.verificationDocuments),
-                choose = { sourceFor = type }, retry = {
-                    if (model.pendingEvidenceType == type.name) model.retryEvidence()
-                    else model.verificationDocuments.firstOrNull { it.documentType == type.name }?.let { model.confirmSavedEvidence(it.documentId) }
-                }, next = { if (!idBack) idBack = true else step = 3 })
-        }
-        return
-    }
-    PageBody(back, !model.busy) {
+        { sourceFor = null; camera = type },
+        { sourceFor = null; choosing = type; picker.launch(arrayOf("image/jpeg", "image/png")) }) }
+    VerificationPageBody(back, { model.go(OwnerScreen.HOME) }, !model.busy, if (!started && !terminal) "Verification" else "Capture documents") {
         model.notice?.let { SharedNote(it); Gap(8) }
         when {
             terminal -> VerificationOutcomeScreen(
                 role = "Landlord", status = status!!, rejectionReason = model.verification?.rejectionReason,
                 busy = model.busy, approvedAction = "Continue to listings",
-                onApproved = { model.go(OwnerScreen.LISTINGS) },
-                onCorrect = { correcting = true; step = 2; idBack = false },
+                onApproved = { model.go(OwnerScreen.LISTINGS) }, onCorrect = { correcting = true },
                 onClose = { model.go(OwnerScreen.HOME) }, onRefresh = model::loadVerification)
-            cameraId != null -> {
-                val type = cameraId!!
-                Heading(if (type == OwnerEvidence.SELFIE) "A quick selfie" else type.title)
-                Gap(20)
-                key(type) {
-                    EvidenceCamera(type == OwnerEvidence.SELFIE, editable, { bitmap ->
-                        cameraId = null
-                        if (type == OwnerEvidence.SELFIE) model.uploadSelfie(bitmap) else model.uploadCameraEvidence(type, bitmap)
-                    }, model::showNotice)
-                }
-                SharedLink("Cancel camera", !model.busy) { cameraId = null }
+            !started && editable -> VerificationIntro("Landlord", "Confirms your identity and authority to list a whole property or unit.", "Proof of ownership") { started = true }
+            camera != null -> {
+                val type = camera!!
+                Heading(if (type == OwnerEvidence.SELFIE) "Capture selfie" else type.title); Gap(20)
+                key(type) { EvidenceCamera(type == OwnerEvidence.SELFIE, editable && !model.busy, { bitmap ->
+                    camera = null
+                    if (type == OwnerEvidence.SELFIE) model.uploadSelfie(bitmap) else model.uploadCameraEvidence(type, bitmap)
+                }, model::showNotice) }
+                SharedLink("Cancel camera", !model.busy) { camera = null }
             }
-            step == 3 -> {
-                val ready = evidenceReady(OwnerEvidence.SELFIE, model.verificationDocuments)
-                VerificationSelfieStep(ready, model.busy) {
-                    if (ready) step = 4 else cameraId = OwnerEvidence.SELFIE
-                }
-            }
-            step == 4 -> VerificationRoleDocumentStep(
-                title = "Proof of ownership",
-                subtitle = "Landlord · Confirm your authority to list",
-                label = "Ownership document",
-                name = model.evidenceNames[OwnerEvidence.OWNERSHIP_PROOF],
-                ready = evidenceReady(OwnerEvidence.OWNERSHIP_PROOF, model.verificationDocuments),
-                busy = model.busy,
-                guidance = "Include the relevant pages\n\nProperty address\nMatches your whole-property or unit listing.\n\nOwner or authorised representative\nThe name and authority must be readable.",
-                privacy = "Staff-only evidence\nThis document is never published in the listing or sent to applicants.",
-                choose = { choose(OwnerEvidence.OWNERSHIP_PROOF) }, next = { step = 5 })
-            else -> VerificationReviewSummary(
-                roleDocument = "Proof of ownership",
-                ready = verificationReady(model.verificationDocuments), busy = model.busy,
-                submit = model::submitVerification, replace = { step = 2; idBack = false })
-        }
-        model.verificationDocuments.filter { it.status == "UPLOADING" && model.verificationPendingId == null }.forEach { value ->
-            SharedLink("Confirm ${value.documentType.lowercase().replace('_', ' ')}", !model.busy) {
-                model.confirmSavedEvidence(value.documentId)
+            roleProof -> VerificationRoleDocumentStep(
+                title = "Proof of ownership", subtitle = "Landlord · Confirm your authority to list",
+                label = "Ownership document", name = model.evidenceNames[OwnerEvidence.OWNERSHIP_PROOF],
+                ready = evidenceReady(OwnerEvidence.OWNERSHIP_PROOF, model.verificationDocuments), busy = model.busy,
+                guidance = "Include the relevant pages showing the property and your authority to list it.",
+                privacy = "Only authorised verification staff can view this document.",
+                choose = { choosing = OwnerEvidence.OWNERSHIP_PROOF; picker.launch(arrayOf("application/pdf")) },
+                next = model::submitVerification)
+            else -> {
+                val types = listOf(OwnerEvidence.ID_FRONT, OwnerEvidence.ID_BACK, OwnerEvidence.SELFIE)
+                IdentityCaptureChecklist(
+                    role = "Landlord", busy = model.busy, editable = editable,
+                    stage = model.evidenceStage, progress = model.evidenceProgress,
+                    items = types.map { type -> IdentityCaptureItem(
+                        type.name,
+                        when (type) { OwnerEvidence.ID_FRONT -> "National ID (front)"; OwnerEvidence.ID_BACK -> "National ID (back)"; else -> "Selfie" },
+                        when (type) { OwnerEvidence.ID_FRONT -> "Photo side, fit the card inside the frame"; OwnerEvidence.ID_BACK -> "Turn the card over, all four corners visible"; else -> "Remove spectacles, face the camera" },
+                        model.pendingEvidenceType != type.name && evidenceReady(type, model.verificationDocuments),
+                        model.busy && model.pendingEvidenceType == type.name
+                    ) },
+                    onCapture = { key -> capture(OwnerEvidence.valueOf(key)) },
+                    onContinue = { roleProof = true }
+                )
             }
         }
-        if (model.verificationPendingId != null) SharedButton("Retry current document", !model.busy, model::retryEvidence)
     }
 }
 

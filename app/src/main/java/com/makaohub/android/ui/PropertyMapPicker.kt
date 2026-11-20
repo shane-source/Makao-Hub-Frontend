@@ -5,7 +5,10 @@ import android.content.res.Configuration
 import android.location.Geocoder
 import android.view.MotionEvent
 import android.view.View
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
+import androidx.compose.ui.graphics.Color
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
@@ -16,6 +19,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import com.makaohub.android.BuildConfig
 import com.makaohub.android.data.validOwnerPin
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -38,7 +42,14 @@ import org.maplibre.android.style.sources.GeoJsonSource
 import org.maplibre.geojson.Feature
 import org.maplibre.geojson.FeatureCollection
 import org.maplibre.geojson.Point
+import java.net.HttpURLConnection
+import java.net.URL
+import java.net.URLEncoder
 import java.util.Locale
+import org.json.JSONArray
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.ui.text.input.ImeAction
 
 private const val MAP_STYLE = "https://tiles.openfreemap.org/styles/liberty"
 private const val PIN_SOURCE = "private-property-pin"
@@ -50,8 +61,10 @@ internal fun privatePinFeatures(pin: LatLng?): FeatureCollection = FeatureCollec
 )
 
 /** In-memory selection; only the parent's explicit Save action calls the owner API. */
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun PropertyMapPicker(pin: LatLng?, enabled: Boolean, showDeveloperDetails: Boolean = true, onPin: (LatLng) -> Unit) {
+fun PropertyMapPicker(pin: LatLng?, enabled: Boolean, showDeveloperDetails: Boolean = false,
+    initialCounty: String? = null, onCounty: (String) -> Unit = {}, onPin: (LatLng) -> Unit) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     var query by remember { mutableStateOf("") }
@@ -59,45 +72,80 @@ fun PropertyMapPicker(pin: LatLng?, enabled: Boolean, showDeveloperDetails: Bool
     var problem by remember { mutableStateOf<String?>(null) }
     var mapProblem by remember { mutableStateOf<String?>(null) }
     var retry by remember { mutableIntStateOf(0) }
-    OutlinedTextField(query, { query = it.take(150) }, label = { Text("Search property address") },
-        enabled = enabled && !searching, singleLine = true, modifier = Modifier.fillMaxWidth())
-    OutlinedButton({
-        if (query.isBlank()) { problem = "Enter an address, or select the property on the map."; return@OutlinedButton }
-        if (!Geocoder.isPresent()) { problem = "Address search is unavailable on this device. Pan, zoom and tap the map."; return@OutlinedButton }
+    var county by remember { mutableStateOf(KenyanCounties.firstOrNull { it.equals(initialCounty, true) }) }
+    var countyOpen by remember { mutableStateOf(false) }
+
+    fun search() {
+        val selected = county
+        val text = query.trim()
+        if (selected == null) { problem = "Select a county first."; return }
+        if (text.length < 3) { problem = "Type your address, estate or landmark."; return }
         searching = true; problem = null
-        val address = query.trim()
         scope.launch {
             try {
-                @Suppress("DEPRECATION")
-                val point = withContext(Dispatchers.IO) {
-                    Geocoder(context, Locale.getDefault()).getFromLocationName(address, 1, -5.0, 33.0, 5.5, 42.5)
-                        ?.firstOrNull()?.let { LatLng(it.latitude, it.longitude) }
-                }
-                if (point == null || !validOwnerPin(point.latitude, point.longitude))
-                    problem = "No supported location was found. Select the property on the map."
-                else onPin(point)
+                val point = withContext(Dispatchers.IO) { lookupAddress(context, "$text, $selected County, Kenya") }
+                if (point != null && validOwnerPin(point.latitude, point.longitude)) onPin(point)
+                else problem = "Address not found. Try a nearby estate or road, or tap the map."
             } catch (cancel: CancellationException) { throw cancel }
-            catch (_: Exception) { problem = "Address search could not complete. Pan, zoom and tap the map instead." }
+            catch (_: Exception) { problem = "Address search failed. Check your internet or tap the map." }
             finally { searching = false }
         }
-    }, enabled = enabled && !searching) { Text(if (searching) "Searching…" else "Find address") }
-    problem?.let { Note(it); Gap(10) }
-    BodyCopy("Pan and zoom, then tap the exact property point. Address results are approximate—check the pin before saving.", true)
+    }
+
+    BodyCopy("1. Find the area", true)
+    ExposedDropdownMenuBox(expanded = countyOpen, onExpandedChange = { if (enabled) countyOpen = it }) {
+        OutlinedTextField(value = county ?: "", onValueChange = {}, readOnly = true,
+            label = { Text("County") }, placeholder = { Text("Choose your county") },
+            trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(countyOpen) }, enabled = enabled,
+            modifier = Modifier.menuAnchor().fillMaxWidth())
+        ExposedDropdownMenu(expanded = countyOpen, onDismissRequest = { countyOpen = false }) {
+            KenyanCounties.forEach { option -> DropdownMenuItem(text = { Text(option) }, onClick = {
+                county = option; countyOpen = false; problem = null; onCounty(option)
+            }) }
+        }
+    }
+    Gap(12)
+    BodyCopy("2. Find the address", true)
+    OutlinedTextField(query, { query = it.take(150) }, label = { Text("Estate, road or landmark") },
+        placeholder = { Text("e.g. Kilimani, Argwings Kodhek Road") },
+        enabled = enabled, singleLine = true, modifier = Modifier.fillMaxWidth(),
+        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+        keyboardActions = KeyboardActions(onSearch = { search() }))
+    Gap(8)
+    OutlinedButton(onClick = { search() }, enabled = enabled && !searching) { Text(if (searching) "Searching…" else "Find address") }
+    problem?.let { Gap(6); Note(it) }
     Gap(12)
     key(retry) {
-        NativePropertyMap(pin, enabled && !searching, onPin, onProblem = { mapProblem = it })
+        ProviderPropertyMap(pin, enabled && !searching, onPin, false) { mapProblem = it }
     }
-    // Credits remain visible without opening the SDK attribution control.
-    BodyCopy("© OpenMapTiles · © OpenStreetMap contributors · Maps by OpenFreeMap", true)
     mapProblem?.let {
         Note(it)
         OutlinedButton({ mapProblem = null; retry++ }, enabled = enabled && !searching) { Text("Retry map") }
     }
-    Gap(10)
-    BodyCopy(if (pin == null) "No property pin selected yet."
-        else "Property pin selected · Exact location stays private.", true)
-    Gap(12)
-    if (showDeveloperDetails) Note("No map API key or billing setup is needed. OpenFreeMap receives requests for the map areas you view; address search uses your device's geocoding service. No Makao JWTs, ID documents or payment details are sent to these services.")
+    Gap(6)
+    BodyCopy(if (pin == null) "Tap the map to drop your pin." else "Pin placed. Tap elsewhere to move it.", true)
+}
+
+/** Device geocoder first, then OpenStreetMap search so it also works on phones without Google services. */
+@Suppress("DEPRECATION")
+private fun lookupAddress(context: android.content.Context, text: String): LatLng? {
+    if (Geocoder.isPresent()) {
+        try {
+            Geocoder(context, Locale.getDefault()).getFromLocationName(text, 1, -5.0, 33.0, 5.5, 42.5)
+                ?.firstOrNull()?.let { return LatLng(it.latitude, it.longitude) }
+        } catch (_: Exception) { }
+    }
+    val url = URL("https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&countrycodes=ke&q=" +
+        URLEncoder.encode(text, "UTF-8"))
+    val connection = (url.openConnection() as HttpURLConnection).apply {
+        connectTimeout = 8000; readTimeout = 8000
+        setRequestProperty("User-Agent", "MakaoHub-Android/1.0")
+    }
+    return try {
+        val array = JSONArray(connection.inputStream.bufferedReader().use { it.readText() })
+        if (array.length() == 0) null
+        else array.getJSONObject(0).let { LatLng(it.getString("lat").toDouble(), it.getString("lon").toDouble()) }
+    } finally { connection.disconnect() }
 }
 
 /** Native MapView hosted in Compose, with balanced lifecycle and no saved private camera. */
@@ -202,7 +250,7 @@ private fun NativePropertyMap(pin: LatLng?, enabled: Boolean, onPin: (LatLng) ->
             map?.cameraPosition = CameraPosition.Builder().target(pin).zoom(if (approximate) 11.0 else 17.0).build()
         }
     }
-    AndroidView(factory = { view }, modifier = Modifier.fillMaxWidth().height(360.dp), update = { nativeView ->
+    AndroidView(factory = { view }, modifier = Modifier.fillMaxWidth().height(360.dp).background(Color(0xFFEDE6DC)), update = { nativeView ->
         map?.uiSettings?.setAllGesturesEnabled(enabled)
         nativeView.contentDescription = if (approximate) "Approximate listing area, not an exact property pin" else "Property location map"
         // Preserve map gestures inside the scrolling form; no GPS tracking.
@@ -230,9 +278,20 @@ private fun NativePropertyMap(pin: LatLng?, enabled: Boolean, onPin: (LatLng) ->
     }
 }
 
+@Composable
+private fun ProviderPropertyMap(pin: LatLng?, enabled: Boolean, onPin: (LatLng) -> Unit,
+    approximate: Boolean, onProblem: (String?) -> Unit) {
+    var googleUnavailable by remember { mutableStateOf(BuildConfig.GOOGLE_MAPS_API_KEY.isBlank()) }
+    if (!googleUnavailable) {
+        GooglePropertyMap(pin, enabled, onPin, approximate) { googleUnavailable = true }
+    } else {
+        NativePropertyMap(pin, enabled, onPin, onProblem, approximate)
+    }
+}
+
 /** Only pass approximate public coordinates unless the backend returned a paid exact location. */
 @Composable internal fun RenterAreaMap(point: LatLng, exact: Boolean = false) {
     var problem by remember { mutableStateOf<String?>(null) }
-    key(point.latitude, point.longitude, exact) { NativePropertyMap(point, false, {}, { problem = it }, approximate = !exact) }
+    key(point.latitude, point.longitude, exact) { ProviderPropertyMap(point, false, {}, !exact) { problem = it } }
     problem?.let { Text("Map unavailable. Please try again later.") }
 }
