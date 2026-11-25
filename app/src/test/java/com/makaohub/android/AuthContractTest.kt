@@ -84,7 +84,7 @@ class AuthContractTest {
     @Test fun loginSendsExpectedRoleAndDoesNotCreateSessionBeforeOtp() = runBlocking {
         respond(challenge)
         val result = repository.login(LoginRequest("test@example.test", "example-password", SignupRole.SUBLESSOR))
-        assertEquals("••••@example.test", result.maskedEmail)
+        assertEquals("••••@example.test", result?.maskedEmail)
         val request = server.takeRequest()
         assertEquals("/api/v1/auth/login", request.path)
         val json = JsonParser.parseString(request.body.readUtf8()).asJsonObject
